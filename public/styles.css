@@ -1,0 +1,56 @@
+:root {
+  font-family: Inter, ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  background: #f4f7fb;
+  color: #17233a;
+  font-synthesis: none;
+}
+
+* { box-sizing: border-box; }
+body { min-width: 320px; margin: 0; background: linear-gradient(120deg, #f4f7fb 0%, #fafbff 52%, #f2f8f7 100%); }
+body::before { position: fixed; z-index: -1; top: -260px; right: -170px; width: 620px; height: 620px; border-radius: 50%; background: radial-gradient(circle, #dce9ff 0%, #eaf2ff99 42%, transparent 70%); content: ""; }
+main { width: min(1120px, calc(100% - 48px)); padding: 64px 0 80px; margin: auto; }
+header { max-width: 700px; margin-bottom: 40px; }
+h1 { margin: 8px 0 14px; color: #17233a; font-size: clamp(2.4rem, 6vw, 4.35rem); font-weight: 720; letter-spacing: -.065em; line-height: .98; }
+h2 { margin: 0 0 8px; color: #1c2943; font-size: 1.125rem; letter-spacing: -.02em; }
+p { margin: 0; color: #65728a; line-height: 1.55; }
+.eyebrow { display: flex; align-items: center; gap: 8px; margin: 0; color: #287b72; font-size: .72rem; font-weight: 800; letter-spacing: .135em; }
+.eyebrow::before { width: 9px; height: 9px; border-radius: 50%; background: linear-gradient(135deg, #21c79a, #3485ef); box-shadow: 0 0 0 5px #d9f7ee; content: ""; }
+.card { margin: 20px 0; padding: 28px; border: 1px solid #e0e7f1; border-radius: 16px; background: #fff; box-shadow: 0 1px 2px #25355308; }
+#login.card { max-width: 650px; border-top: 3px solid #31b7a0; }
+form { display: flex; gap: 10px; max-width: 560px; margin-top: 22px; }
+input { flex: 1; min-width: 0; padding: 12px 14px; border: 1px solid #cfd9e8; border-radius: 9px; outline: none; color: #17233a; background: #f8fafd; font: inherit; transition: border-color .16s, box-shadow .16s, background .16s; }
+input:focus { border-color: #3685e8; background: #fff; box-shadow: 0 0 0 3px #3685e81c; }
+button { padding: 12px 17px; border: 1px solid #1a6bd0; border-radius: 9px; color: #fff; background: #286fca; font: 700 .875rem/1 Inter, ui-sans-serif, sans-serif; cursor: pointer; transition: background .16s, border-color .16s, transform .16s; }
+button:hover { border-color: #1b5fad; background: #1f61b9; }
+button:active { transform: translateY(1px); }
+button.secondary { border-color: #cfd9e8; color: #43516a; background: #fff; }
+button.secondary:hover { border-color: #aab9cc; color: #1e3150; background: #f7f9fc; }
+.stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 14px; margin: 2px 0 22px; }
+.stat { position: relative; min-height: 118px; padding: 20px; overflow: hidden; border: 1px solid #e0e7f1; border-radius: 14px; background: #fff; }
+.stat::after { position: absolute; right: 18px; bottom: 18px; width: 11px; height: 11px; border-radius: 50%; background: #3d8cff; content: ""; }
+.stat:nth-child(2)::after { background: #24b99a; }
+.stat:nth-child(3)::after { background: #8b67e8; }
+.stat:nth-child(4)::after { background: #f08b60; }
+.stat span { display: block; color: #718098; font-size: .8rem; font-weight: 650; letter-spacing: .015em; }
+.stat strong { display: block; max-width: 90%; margin-top: 11px; overflow-wrap: anywhere; color: #1e2d48; font-size: 1.45rem; font-variant-numeric: tabular-nums; letter-spacing: -.035em; }
+.section-heading { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.section-heading + .muted { margin: 0 0 16px; }
+.table-wrap { overflow: auto; margin: 2px -8px -6px; }
+table { width: 100%; border-collapse: separate; border-spacing: 0; color: #33425d; text-align: left; }
+th, td { padding: 14px 12px; border-bottom: 1px solid #edf1f6; white-space: nowrap; }
+th { color: #8190a8; font-size: .7rem; font-weight: 800; letter-spacing: .075em; text-transform: uppercase; }
+tbody tr:last-child td { border-bottom: 0; }
+tbody tr:hover td { background: #f7faff; }
+code { padding: 2px 5px; border-radius: 4px; color: #226e68; background: #eef8f6; font-size: .9em; overflow-wrap: anywhere; }
+.muted { color: #8290a5; font-size: .92rem; }
+.error { margin-top: 12px; color: #c34d52; font-weight: 600; }
+
+@media (max-width: 600px) {
+  main { width: min(100% - 32px, 1120px); padding: 42px 0 60px; }
+  h1 { font-size: 2.75rem; }
+  .card { padding: 21px; border-radius: 13px; }
+  form { flex-direction: column; }
+  .stats { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .stat { min-height: 106px; padding: 16px; }
+  .stat strong { font-size: 1.15rem; }
+}

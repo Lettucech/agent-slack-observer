@@ -1,0 +1,26 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Slack Observer</title>
+    <link rel="stylesheet" href="/styles.css">
+  </head>
+  <body>
+    <main>
+      <header><p class="eyebrow">READ-ONLY SLACK OBSERVER</p><h1>Observer dashboard</h1><p>Slack events stored locally. No Slack API calls, no messages sent.</p></header>
+      <section id="login" class="card">
+        <h2>Unlock dashboard</h2>
+        <p>Enter the dashboard token configured in <code>DASHBOARD_AUTH_TOKEN</code>.</p>
+        <form id="login-form"><input id="token" type="password" autocomplete="current-password" placeholder="Dashboard token" required><button>Open dashboard</button></form>
+        <p id="login-error" class="error" hidden></p>
+      </section>
+      <section id="dashboard" hidden>
+        <div class="stats" id="stats"></div>
+        <section class="card"><div class="section-heading"><h2>Observed channels</h2><button id="refresh" class="secondary">Refresh</button></div><p class="muted">Names are deliberately not fetched from Slack. Add a bot to a channel to begin observing it.</p><div class="table-wrap"><table><thead><tr><th>Workspace</th><th>Channel ID</th><th>Messages</th><th>Last observed</th></tr></thead><tbody id="channels"></tbody></table></div></section>
+        <section class="card"><h2>Agent endpoint</h2><p>Configure the agent with the protected Streamable HTTP MCP endpoint:</p><code id="mcp-url"></code><p class="muted">The agent authenticates with <code>Authorization: Bearer $MCP_AUTH_TOKEN</code> and calls <code>get_digest_batches</code> on its own cron.</p></section>
+      </section>
+    </main>
+    <script type="module" src="/app.js"></script>
+  </body>
+</html>

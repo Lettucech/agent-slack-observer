@@ -1,0 +1,33 @@
+services:
+  observer:
+    build: .
+    environment:
+      SLACK_SIGNING_SECRET: ${SLACK_SIGNING_SECRET:?set SLACK_SIGNING_SECRET in .env}
+      MCP_AUTH_TOKEN: ${MCP_AUTH_TOKEN:?set MCP_AUTH_TOKEN in .env}
+      DASHBOARD_AUTH_TOKEN: ${DASHBOARD_AUTH_TOKEN:?set DASHBOARD_AUTH_TOKEN in .env}
+      DATABASE_URL: postgres://observer:observer@db:5432/observer
+      PORT: ${PORT:-3000}
+      THREAD_SETTLE_SECONDS: ${THREAD_SETTLE_SECONDS:-90}
+    ports:
+      - "3000:3000"
+    depends_on:
+      db:
+        condition: service_healthy
+    restart: unless-stopped
+
+  db:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_DB: observer
+      POSTGRES_USER: observer
+      POSTGRES_PASSWORD: observer
+    volumes:
+      - observer-postgres:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U observer -d observer"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+volumes:
+  observer-postgres:
