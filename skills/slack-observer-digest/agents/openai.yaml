@@ -1,0 +1,4 @@
+interface:
+  display_name: "Slack Observer Digest"
+  short_description: "Digest Slack threads efficiently through observer MCP."
+  default_prompt: "Use $slack-observer-digest to review and summarize my pending Slack observer messages."

@@ -92,6 +92,18 @@ The MCP transport is Streamable HTTP at `/mcp`, protected by the independent age
 
 The observer does not own agent progress. An agent cron stores `upperSequence`, thread continuation positions, and processed `eventId`s itself. Poll with a small sequence overlap and de-duplicate `eventId`: a thread with a new reply is intentionally returned with its earlier root/context again, which lets the model read it coherently rather than as a fragment.
 
+### Agent digest skill
+
+This repository ships `slack-observer-digest`, an optional cross-agent skill that teaches an agent to consume these read-only MCP tools safely and efficiently. It uses a thread-first workflow, token-aware batches, local cursors, and event de-duplication; it never instructs the agent to reply in Slack.
+
+After this repository is published to GitHub, install it into Codex with:
+
+```sh
+npx skills add <github-owner>/agent-slack-observer --skill slack-observer-digest --agent codex
+```
+
+Add `-g` to install it globally instead of only in the current agent project. The MCP endpoint and `MCP_AUTH_TOKEN` remain a separate, local agent configuration; the skill contains no deployment URL or credentials. [skills CLI](https://github.com/vercel-labs/skills)
+
 Example remote MCP configuration shape (adapt this to the agent host's configuration format):
 
 ```json
