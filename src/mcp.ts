@@ -7,7 +7,7 @@ import { makeDigestBatch } from "./digest.js";
 export function createMcpTransport(database: Database, defaultSettleSeconds: number) {
   const server = new McpServer(
     { name: "agent-slack-observer", version: "0.1.0" },
-    { instructions: "This server is strictly read-only. It observes Slack Events already stored locally; it never calls Slack APIs or sends Slack messages. Store the returned upperSequence yourself and use it as afterSequence on a later cron run." },
+    { instructions: "This server is strictly read-only. It observes Slack Events already stored locally and never sends Slack messages. Workspace/channel names are cached local metadata; they may briefly be absent or stale. Store the returned upperSequence yourself and use it as afterSequence on a later cron run." },
   );
 
   server.registerTool(
@@ -38,7 +38,7 @@ export function createMcpTransport(database: Database, defaultSettleSeconds: num
     "list_channels",
     {
       title: "List observed channels",
-      description: "List Slack channel IDs that the installed bot has actually produced events for. Channel names are intentionally not looked up from Slack.",
+      description: "List observed Slack channels with their stable IDs and locally cached workspace/channel names, when available.",
       inputSchema: {},
     },
     async () => {

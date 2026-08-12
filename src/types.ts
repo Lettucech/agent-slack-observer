@@ -10,13 +10,17 @@ export type StoredMessage = {
   text: string | null;
   payload: Record<string, unknown>;
   observedAt: string;
+  workspaceName?: string | null;
+  channelName?: string | null;
 };
 
 export type DigestGroup = {
   id: string;
   kind: "thread" | "channel_window";
   workspaceId: string;
+  workspaceName?: string | null;
   channelId: string;
+  channelName?: string | null;
   messages: StoredMessage[];
   estimatedTokens: number;
   threadTs?: string;

@@ -8,16 +8,10 @@
   </head>
   <body>
     <main>
-      <header><p class="eyebrow">READ-ONLY SLACK OBSERVER</p><h1>Observer dashboard</h1><p>Slack events stored locally. No Slack API calls, no messages sent.</p></header>
-      <section id="login" class="card">
-        <h2>Unlock dashboard</h2>
-        <p>Enter the dashboard token configured in <code>DASHBOARD_AUTH_TOKEN</code>.</p>
-        <form id="login-form"><input id="token" type="password" autocomplete="current-password" placeholder="Dashboard token" required><button>Open dashboard</button></form>
-        <p id="login-error" class="error" hidden></p>
-      </section>
-      <section id="dashboard" hidden>
+      <header><p class="eyebrow">READ-ONLY SLACK OBSERVER</p><h1>Observer dashboard</h1><p>Slack events stored locally. Outbound Socket Mode, no messages sent.</p></header>
+      <section id="dashboard">
         <div class="stats" id="stats"></div>
-        <section class="card"><div class="section-heading"><h2>Observed channels</h2><button id="refresh" class="secondary">Refresh</button></div><p class="muted">Names are deliberately not fetched from Slack. Add a bot to a channel to begin observing it.</p><div class="table-wrap"><table><thead><tr><th>Workspace</th><th>Channel ID</th><th>Messages</th><th>Last observed</th></tr></thead><tbody id="channels"></tbody></table></div></section>
+        <section class="card"><div class="section-heading"><div><h2>Observed channels</h2><p id="refresh-status" class="muted" aria-live="polite">Preparing automatic refresh…</p><p id="metadata-status" class="muted" aria-live="polite"></p></div><div class="button-group"><button id="sync-names" class="secondary">Sync names now</button><button id="refresh" class="secondary">Refresh now</button></div></div><p class="muted">Names are retrieved as cached metadata only; no Slack message history is read.</p><div class="table-wrap"><table><thead><tr><th>Workspace</th><th>Channel</th><th>Messages</th><th>Last observed</th></tr></thead><tbody id="channels"></tbody></table></div></section>
         <section class="card"><h2>Agent endpoint</h2><p>Configure the agent with the protected Streamable HTTP MCP endpoint:</p><code id="mcp-url"></code><p class="muted">The agent authenticates with <code>Authorization: Bearer $MCP_AUTH_TOKEN</code> and calls <code>get_digest_batches</code> on its own cron.</p></section>
       </section>
     </main>

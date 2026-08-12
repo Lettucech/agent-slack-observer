@@ -1,16 +1,16 @@
 # Agent Slack Observer
 
-An agent-facing, one-way Slack observer. A Slack app's bot receives Events API webhooks only for channels it has joined; this service verifies and stores them, then exposes **read-only MCP tools** for an agent's own cron job.
+An agent-facing, one-way Slack observer. A Slack app's bot receives Events API payloads over an outbound Socket Mode WebSocket for channels it has joined; this service stores them, then exposes **read-only MCP tools** for an agent's own cron job.
 
 ```text
-Slack channel → Slack Events API → observer database → read-only MCP → agent cron
+Slack channel → Slack Socket Mode → observer database → read-only MCP → agent cron
 ```
 
-The observer never calls Slack Web API, never uses Slack MCP, never posts a reply, and never records whether an agent has processed a message. The only outbound response is the HTTP success response Slack's delivery protocol requires.
+The observer never uses Slack MCP, never posts a reply, and never records whether an agent has processed a message. It makes the narrow app-level `apps.connections.open` call required to establish its outbound Socket Mode WebSocket, and low-frequency name lookups only; it never calls Slack history, search, or messaging APIs.
 
 ## Start it
 
-1. Copy the environment template and replace all three secrets:
+1. Copy the environment template and set the two required secrets:
 
    ```sh
    cp .env.example .env
@@ -22,35 +22,60 @@ The observer never calls Slack Web API, never uses Slack MCP, never posts a repl
    docker compose up --build
    ```
 
-3. Open `http://localhost:3000`, then enter `DASHBOARD_AUTH_TOKEN` to see local ingestion health and channel IDs. The MCP endpoint is `http://localhost:3000/mcp` and requires `Authorization: Bearer $MCP_AUTH_TOKEN`.
+3. Open `http://localhost:${PORT:-3000}` to see local ingestion health and channel IDs. The MCP endpoint is `http://localhost:${PORT:-3000}/mcp` and requires `Authorization: Bearer $MCP_AUTH_TOKEN`.
 
-`DATABASE_URL` inside Compose always points to the included PostgreSQL container. For a non-Compose deployment, replace it with the deployment's PostgreSQL URL.
+PostgreSQL is internal to Docker Compose. The observer receives its database connection only from the Compose network; users never need to configure a database URL. Compose binds the dashboard and MCP port to `127.0.0.1` only, so other LAN devices cannot reach it.
+
+## Environment variables
+
+Copy `.env.example` to `.env`; it is ignored by Git. Keep the file and its values out of source control, screenshots, and logs.
+
+| Variable | Required | Where the value comes from | Purpose |
+| --- | --- | --- | --- |
+| `SLACK_APP_TOKEN` | Yes | Slack App settings → **Basic Information** → **App-Level Tokens** → **Generate Token and Scopes**; select `connections:write`. It starts with `xapp-`. | Opens and reconnects the outbound Slack Socket Mode WebSocket. It is not a bot token. |
+| `SLACK_BOT_TOKEN` | Yes | Slack App settings → **OAuth & Permissions** → **OAuth Tokens for Your Workspace**, after installing/reinstalling the app. It starts with `xoxb-`. | Low-frequency lookup of workspace/channel names only; never reads message history. |
+| `MCP_AUTH_TOKEN` | Yes | Generate locally: `openssl rand -base64 32` | Bearer token for the agent connecting to `/mcp`. |
+| `PORT` | No | Local deployment choice; defaults to `3000`. | Localhost-only host port published by Docker Compose. The observer itself always listens on private container port `3000`. |
+| `THREAD_SETTLE_SECONDS` | No | Local deployment choice; defaults to `90`. | How long a newly active thread waits before MCP offers it to an agent. |
+
+### Why the Slack App-Level Token is needed
+
+Company networks that allow outbound connections but block inbound public callbacks can use Slack Socket Mode. `SLACK_APP_TOKEN` is an app-level `xapp-…` token with only `connections:write`; the observer uses it to request a temporary WebSocket URL, then connects out to Slack and receives Events API payloads on that socket. No public webhook URL, tunnel, or inbound Slack request is required. [Slack Socket Mode](https://api.slack.com/apis/connections/socket) [connections:write scope](https://docs.slack.dev/reference/scopes/connections.write/)
+
+Do **not** put any of these in `.env` for this project:
+
+- OAuth client secret — only needed when this service implements an OAuth installation flow; users install their Slack app themselves.
+- `DATABASE_URL` — Docker Compose creates the PostgreSQL service and passes its private, internal connection URL directly to the observer.
 
 ## Slack app setup
 
 This service does **not** create or install the Slack app. Each user does that in Slack, then adds the installed bot to the channels they intentionally want observed.
 
 1. Create a Slack app, enable a bot user, and install it to the target workspace.
-2. Under **OAuth & Permissions**, add the minimal bot scope for every channel type you choose to observe:
+2. Under **OAuth & Permissions**, add the minimal bot scope for every channel type you choose to observe, plus read-only metadata scopes:
    - Public channels: `channels:history`
    - Private channels (optional): `groups:history`
    - Direct messages (optional): `im:history`
    - Group direct messages (optional): `mpim:history`
-3. Under **Event Subscriptions**, enable events and set the Request URL to `https://YOUR-HOST/slack/events`. Slack must be able to reach it over public HTTPS.
-4. Subscribe to the corresponding bot events: `message.channels` (and, only if required, `message.groups`, `message.im`, `message.mpim`).
-5. Copy the Slack app's **Signing Secret** to `SLACK_SIGNING_SECRET`, restart the observer, and let Slack verify the URL.
-6. Add the bot to each channel being observed. The observer does no channel discovery and makes no history backfill request.
+   - Workspace name: `team:read`
+   - Public channel name: `channels:read`
+   - Private/DM/MPIM names (only when those are observed): `groups:read`, `im:read`, `mpim:read`
+3. Under **Settings → Socket Mode**, enable Socket Mode. No Request URL is needed or allowed in this mode.
+4. Under **Settings → Basic Information → App-Level Tokens**, choose **Generate Token and Scopes**, give it a name, select `connections:write`, and copy the generated `xapp-…` value into `SLACK_APP_TOKEN`.
+5. Under **Event Subscriptions**, enable events and subscribe to the corresponding bot events: `message.channels` (and, only if required, `message.groups`, `message.im`, `message.mpim`).
+6. Reinstall the app after scope changes, then copy its `xoxb-…` bot token from **OAuth Tokens for Your Workspace** into `SLACK_BOT_TOKEN`.
+7. Add the bot to each channel being observed. The observer does no channel discovery and makes no history backfill request.
 
-The observer needs no bot token (`xoxb-…`); do not put one in `.env`.
+The observer uses the bot token only for `team.info` and `conversations.info` metadata calls. It never calls `conversations.history` or `conversations.replies`.
 
 ## What happens on a new message
 
-1. Slack sends a signed HTTP event to `/slack/events`.
-2. The observer checks its timestamp and HMAC signature against the exact raw body, rejects stale or invalid requests, then stores a raw event and a normalized message in PostgreSQL.
+1. The observer opens an outbound Socket Mode WebSocket to Slack with its restricted app-level token.
+2. Slack sends an event envelope down that socket; the observer stores the raw event and a normalized message in PostgreSQL.
 3. `event_id` is unique, so Slack retries cannot create duplicate records.
-4. The endpoint returns `200 OK` to Slack. This is a delivery acknowledgement, **not** a Slack channel reply.
+4. The observer acknowledges the socket envelope. This is delivery protocol traffic only, **not** a Slack channel reply.
 
-The write happens before the response and is intentionally small; model work never runs in the webhook path.
+The write happens before the socket acknowledgement and is intentionally small; model work never runs in the ingestion path.
 
 ## MCP: context-aware reads
 
@@ -78,7 +103,7 @@ Example remote MCP configuration shape (adapt this to the agent host's configura
 
 ## Dashboard and security
 
-The dashboard is a human-only view. It has a separate `DASHBOARD_AUTH_TOKEN`, creates a 12-hour HTTP-only browser session, and does not expose MCP credentials. Put the service behind TLS in real deployment and keep both tokens secret. PostgreSQL stores raw message payloads, so set backups and infrastructure access policy accordingly.
+The dashboard is intentionally unauthenticated for this local-first deployment. It shows observer status plus cached workspace/channel names and IDs; it does not expose MCP credentials. `MCP_AUTH_TOKEN` remains required to read messages through MCP, and Slack Socket Mode requires the app-level token for ingestion. Add an authentication system before exposing the dashboard beyond the intended local environment. PostgreSQL stores raw message payloads, so set backups and infrastructure access policy accordingly.
 
 ## Verification
 
@@ -89,4 +114,4 @@ docker compose up --build
 curl http://localhost:3000/healthz
 ```
 
-The tests cover Slack signing checks plus thread grouping and oversized-thread root retention. A live Slack webhook still needs a public HTTPS URL and a manually configured Slack app.
+The tests cover thread grouping and oversized-thread root retention. A live Slack connection needs an outbound-allowed network and a manually configured Socket Mode Slack app.

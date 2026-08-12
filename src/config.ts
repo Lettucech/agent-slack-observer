@@ -1,8 +1,8 @@
 export type Config = {
   databaseUrl: string;
-  slackSigningSecret: string;
+  slackAppToken: string;
+  slackBotToken: string;
   mcpAuthToken: string;
-  dashboardAuthToken: string;
   port: number;
   threadSettleSeconds: number;
 };
@@ -22,9 +22,9 @@ export function loadConfig(): Config {
   }
   return {
     databaseUrl: required("DATABASE_URL"),
-    slackSigningSecret: required("SLACK_SIGNING_SECRET"),
+    slackAppToken: required("SLACK_APP_TOKEN"),
+    slackBotToken: required("SLACK_BOT_TOKEN"),
     mcpAuthToken: required("MCP_AUTH_TOKEN"),
-    dashboardAuthToken: required("DASHBOARD_AUTH_TOKEN"),
     port,
     threadSettleSeconds,
   };
