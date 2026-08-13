@@ -7,6 +7,12 @@ export type SocketModeStatus = {
   lastError: string | null;
 };
 
+export type SocketLifecycle = {
+  connected?: () => void;
+  disconnected?: () => void;
+  eventStored?: () => void;
+};
+
 type SocketEnvelope = {
   envelope_id?: unknown;
   type?: unknown;
@@ -23,7 +29,12 @@ export class SocketModeObserver {
   private reconnectTimer: ReturnType<typeof setTimeout> | undefined;
   private statusValue: SocketModeStatus = { state: "stopped", lastConnectedAt: null, lastEventAt: null, lastError: null };
 
-  constructor(private readonly appToken: string, private readonly database: Database, private readonly onStored?: (workspaceId: string, channelId: string) => void) {}
+  constructor(
+    private readonly appToken: string,
+    private readonly database: Database,
+    private readonly onStored?: (workspaceId: string, channelId: string) => void,
+    private readonly lifecycle?: SocketLifecycle,
+  ) {}
 
   status(): SocketModeStatus { return { ...this.statusValue }; }
 
@@ -53,10 +64,12 @@ export class SocketModeObserver {
       socket.addEventListener("open", () => {
         this.reconnectAttempt = 0;
         this.statusValue = { ...this.statusValue, state: "connected", lastConnectedAt: new Date().toISOString(), lastError: null };
+        this.lifecycle?.connected?.();
       });
       socket.addEventListener("message", (event) => { void this.handleMessage(socket, event.data); });
       socket.addEventListener("error", () => { this.statusValue.lastError = "Slack Socket Mode connection error"; });
       socket.addEventListener("close", () => {
+        this.lifecycle?.disconnected?.();
         if (!this.stopped && this.socket === socket) this.scheduleReconnect();
       });
     } catch (error) {
@@ -88,6 +101,7 @@ export class SocketModeObserver {
       if (envelope.type !== "events_api" || !isObject(envelope.payload)) return;
       await this.database.storeEnvelope(envelope.payload as SlackEnvelope);
       this.statusValue.lastEventAt = new Date().toISOString();
+      this.lifecycle?.eventStored?.();
       if (typeof envelope.envelope_id === "string" && socket.readyState === WebSocket.OPEN) {
         socket.send(JSON.stringify({ envelope_id: envelope.envelope_id }));
       }

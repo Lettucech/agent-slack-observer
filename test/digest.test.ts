@@ -25,3 +25,10 @@ test("splits an oversized thread with its root message retained", () => {
   assert.equal(batch.groups[0].messages[0].eventId, "Ev1");
   assert.equal(batch.groups[0].threadContinues, true);
 });
+
+test("orders reverse-paginated backfill by Slack timestamp rather than insertion sequence", () => {
+  const older = message(20, "1000.000001", "Older root");
+  const newer = message(10, "1001.000001", "Newer root");
+  const batch = makeDigestBatch([newer, older], { maxTokens: 2000 }, 20);
+  assert.deepEqual(batch.groups[0].messages.map((item) => item.eventId), ["Ev20", "Ev10"]);
+});

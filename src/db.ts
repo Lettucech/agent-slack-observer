@@ -1,247 +1,412 @@
-import { Pool } from "pg";
+import { Pool, type PoolClient } from "pg";
 import type { StoredMessage } from "./types.js";
 
-export type SlackEnvelope = {
-  event_id?: unknown;
-  team_id?: unknown;
-  api_app_id?: unknown;
-  type?: unknown;
-  event?: unknown;
-};
+export type SlackEnvelope = { event_id?: unknown; team_id?: unknown; api_app_id?: unknown; type?: unknown; event?: unknown };
+export type SlackHistoryMessage = Record<string, unknown> & { ts: string; type?: string; thread_ts?: string; reply_count?: number; latest_reply?: string };
+export type BackfillTask = { id: number; jobId: number; workspaceId: string; channelId: string; phase: "history" | "replies"; cursor: string | null; rootTs: string | null; oldest: string; latest: string; attempts: number };
+export type BackfillJob = { id: number; kind: "initial" | "manual" | "downtime"; state: string; requestedStartAt: string; requestedEndAt: string; createdAt: string; completedAt: string | null; channels: number; completedTasks: number; totalTasks: number; historyTasks: number; replyTasks: number; lastError: string | null };
 
 export class Database {
   readonly pool: Pool;
 
-  constructor(connectionString: string) {
-    this.pool = new Pool({ connectionString });
-  }
+  constructor(connectionString: string) { this.pool = new Pool({ connectionString }); }
 
   async migrate(): Promise<void> {
     await this.pool.query(`
       CREATE TABLE IF NOT EXISTS slack_events (
-        event_sequence BIGSERIAL PRIMARY KEY,
-        event_id TEXT NOT NULL UNIQUE,
-        workspace_id TEXT NOT NULL,
-        api_app_id TEXT,
-        callback_type TEXT NOT NULL,
-        event_type TEXT,
-        event_ts TEXT,
-        received_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-        payload JSONB NOT NULL
+        event_sequence BIGSERIAL PRIMARY KEY, event_id TEXT NOT NULL UNIQUE, workspace_id TEXT NOT NULL,
+        api_app_id TEXT, callback_type TEXT NOT NULL, event_type TEXT, event_ts TEXT,
+        received_at TIMESTAMPTZ NOT NULL DEFAULT now(), payload JSONB NOT NULL
       );
-      CREATE INDEX IF NOT EXISTS slack_events_workspace_received_idx
-        ON slack_events (workspace_id, received_at DESC);
+      CREATE INDEX IF NOT EXISTS slack_events_workspace_received_idx ON slack_events (workspace_id, received_at DESC);
       CREATE TABLE IF NOT EXISTS messages (
-        event_id TEXT PRIMARY KEY REFERENCES slack_events(event_id) ON DELETE CASCADE,
-        event_sequence BIGINT NOT NULL UNIQUE,
-        workspace_id TEXT NOT NULL,
-        channel_id TEXT NOT NULL,
-        message_ts TEXT NOT NULL,
-        thread_ts TEXT,
-        user_id TEXT,
-        subtype TEXT,
-        text TEXT,
-        event_payload JSONB NOT NULL,
-        observed_at TIMESTAMPTZ NOT NULL
+        event_id TEXT PRIMARY KEY REFERENCES slack_events(event_id) ON DELETE CASCADE, event_sequence BIGINT NOT NULL UNIQUE,
+        workspace_id TEXT NOT NULL, channel_id TEXT NOT NULL, message_ts TEXT NOT NULL, thread_ts TEXT,
+        user_id TEXT, subtype TEXT, text TEXT, event_payload JSONB NOT NULL, observed_at TIMESTAMPTZ NOT NULL
       );
-      CREATE INDEX IF NOT EXISTS messages_thread_idx
-        ON messages (workspace_id, channel_id, thread_ts, event_sequence);
+      -- Raw events expire before normalized messages, so the latter cannot retain a foreign key to the former.
+      ALTER TABLE messages DROP CONSTRAINT IF EXISTS messages_event_id_fkey;
+      CREATE TABLE IF NOT EXISTS consumer_message_acks (
+        consumer_id TEXT NOT NULL, event_id TEXT NOT NULL REFERENCES messages(event_id) ON DELETE CASCADE,
+        acknowledged_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+        PRIMARY KEY (consumer_id, event_id)
+      );
+      CREATE INDEX IF NOT EXISTS consumer_message_acks_event_idx ON consumer_message_acks (event_id);
+      CREATE INDEX IF NOT EXISTS messages_thread_idx ON messages (workspace_id, channel_id, thread_ts, event_sequence);
+      CREATE INDEX IF NOT EXISTS messages_identity_idx ON messages (workspace_id, channel_id, message_ts);
+      CREATE INDEX IF NOT EXISTS messages_timestamp_idx ON messages (message_ts);
       CREATE INDEX IF NOT EXISTS messages_sequence_idx ON messages (event_sequence);
       CREATE TABLE IF NOT EXISTS channel_labels (
-        workspace_id TEXT NOT NULL,
-        channel_id TEXT NOT NULL,
-        label TEXT NOT NULL,
-        updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+        workspace_id TEXT NOT NULL, channel_id TEXT NOT NULL, label TEXT NOT NULL, updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
         PRIMARY KEY (workspace_id, channel_id)
       );
       CREATE TABLE IF NOT EXISTS workspace_metadata (
-        workspace_id TEXT PRIMARY KEY,
-        workspace_name TEXT,
-        last_synced_at TIMESTAMPTZ,
-        last_attempted_at TIMESTAMPTZ,
-        last_error TEXT
+        workspace_id TEXT PRIMARY KEY, workspace_name TEXT, last_synced_at TIMESTAMPTZ, last_attempted_at TIMESTAMPTZ, last_error TEXT
       );
       CREATE TABLE IF NOT EXISTS channel_metadata (
-        workspace_id TEXT NOT NULL,
-        channel_id TEXT NOT NULL,
-        channel_name TEXT,
-        last_synced_at TIMESTAMPTZ,
-        last_attempted_at TIMESTAMPTZ,
-        last_error TEXT,
+        workspace_id TEXT NOT NULL, channel_id TEXT NOT NULL, channel_name TEXT, last_synced_at TIMESTAMPTZ, last_attempted_at TIMESTAMPTZ, last_error TEXT,
         PRIMARY KEY (workspace_id, channel_id)
+      );
+      CREATE TABLE IF NOT EXISTS observation_targets (
+        workspace_id TEXT NOT NULL, channel_id TEXT NOT NULL, enabled BOOLEAN NOT NULL DEFAULT true,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT now(), updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+        PRIMARY KEY (workspace_id, channel_id)
+      );
+      CREATE TABLE IF NOT EXISTS thread_index (
+        workspace_id TEXT NOT NULL, channel_id TEXT NOT NULL, root_ts TEXT NOT NULL,
+        observed_reply_count INTEGER NOT NULL DEFAULT 0, fetched_reply_count INTEGER NOT NULL DEFAULT 0,
+        latest_reply_ts TEXT, indexed_at TIMESTAMPTZ NOT NULL DEFAULT now(), fetched_at TIMESTAMPTZ,
+        PRIMARY KEY (workspace_id, channel_id, root_ts)
+      );
+      CREATE TABLE IF NOT EXISTS backfill_jobs (
+        id BIGSERIAL PRIMARY KEY, kind TEXT NOT NULL CHECK (kind IN ('initial', 'manual', 'downtime')),
+        state TEXT NOT NULL DEFAULT 'queued' CHECK (state IN ('queued', 'running', 'completed', 'canceled')),
+        requested_start_at TIMESTAMPTZ NOT NULL, requested_end_at TIMESTAMPTZ NOT NULL,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT now(), updated_at TIMESTAMPTZ NOT NULL DEFAULT now(), completed_at TIMESTAMPTZ, last_error TEXT
+      );
+      CREATE TABLE IF NOT EXISTS backfill_tasks (
+        id BIGSERIAL PRIMARY KEY, job_id BIGINT NOT NULL REFERENCES backfill_jobs(id) ON DELETE CASCADE,
+        workspace_id TEXT NOT NULL, channel_id TEXT NOT NULL,
+        phase TEXT NOT NULL CHECK (phase IN ('history', 'replies')), root_ts TEXT,
+        oldest TEXT NOT NULL, latest TEXT NOT NULL, cursor TEXT,
+        state TEXT NOT NULL DEFAULT 'queued' CHECK (state IN ('queued', 'running', 'retry', 'completed', 'canceled')),
+        attempts INTEGER NOT NULL DEFAULT 0, not_before TIMESTAMPTZ, last_error TEXT,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT now(), updated_at TIMESTAMPTZ NOT NULL DEFAULT now(), completed_at TIMESTAMPTZ
+      );
+      CREATE INDEX IF NOT EXISTS backfill_tasks_ready_idx ON backfill_tasks (state, not_before, id);
+      CREATE UNIQUE INDEX IF NOT EXISTS backfill_reply_task_unique ON backfill_tasks (job_id, workspace_id, channel_id, root_ts) WHERE phase = 'replies';
+      CREATE TABLE IF NOT EXISTS backfill_runtime (
+        singleton BOOLEAN PRIMARY KEY DEFAULT true CHECK (singleton), next_request_at TIMESTAMPTZ, last_error TEXT, updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+      );
+      INSERT INTO backfill_runtime (singleton) VALUES (true) ON CONFLICT (singleton) DO NOTHING;
+      CREATE TABLE IF NOT EXISTS observer_health (
+        singleton BOOLEAN PRIMARY KEY DEFAULT true CHECK (singleton), socket_state TEXT NOT NULL DEFAULT 'unknown',
+        last_connected_at TIMESTAMPTZ, last_disconnected_at TIMESTAMPTZ, last_event_at TIMESTAMPTZ, updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+      );
+      INSERT INTO observer_health (singleton) VALUES (true) ON CONFLICT (singleton) DO NOTHING;
+      CREATE TABLE IF NOT EXISTS backfill_suggestions (
+        id BIGSERIAL PRIMARY KEY, start_at TIMESTAMPTZ NOT NULL, end_at TIMESTAMPTZ NOT NULL,
+        state TEXT NOT NULL DEFAULT 'pending' CHECK (state IN ('pending', 'accepted', 'dismissed')),
+        created_at TIMESTAMPTZ NOT NULL DEFAULT now(), UNIQUE (start_at, end_at)
       );
     `);
   }
 
   async storeEnvelope(envelope: SlackEnvelope): Promise<{ inserted: boolean; eventSequence?: number }> {
-    const eventId = typeof envelope.event_id === "string" ? envelope.event_id : null;
-    const workspaceId = typeof envelope.team_id === "string" ? envelope.team_id : null;
-    const callbackType = typeof envelope.type === "string" ? envelope.type : null;
+    const eventId = stringValue(envelope.event_id); const workspaceId = stringValue(envelope.team_id); const callbackType = stringValue(envelope.type);
     if (!eventId || !workspaceId || !callbackType) throw new Error("Slack event envelope is missing event_id, team_id, or type");
     const event = isObject(envelope.event) ? envelope.event : {};
     const insert = await this.pool.query<{ event_sequence: string }>(
       `INSERT INTO slack_events (event_id, workspace_id, api_app_id, callback_type, event_type, event_ts, payload)
-       VALUES ($1, $2, $3, $4, $5, $6, $7)
-       ON CONFLICT (event_id) DO NOTHING
-       RETURNING event_sequence`,
-      [eventId, workspaceId, typeof envelope.api_app_id === "string" ? envelope.api_app_id : null, callbackType,
-        typeof event.type === "string" ? event.type : null, typeof event.event_ts === "string" ? event.event_ts : null, envelope],
+       VALUES ($1, $2, $3, $4, $5, $6, $7) ON CONFLICT (event_id) DO NOTHING RETURNING event_sequence`,
+      [eventId, workspaceId, stringValue(envelope.api_app_id), callbackType, stringValue(event.type), stringValue(event.event_ts), envelope],
     );
     if (insert.rowCount === 0) return { inserted: false };
     const eventSequence = Number(insert.rows[0].event_sequence);
     if (event.type === "message" && typeof event.channel === "string" && typeof event.ts === "string") {
-      await this.pool.query(
-        `INSERT INTO messages (event_id, event_sequence, workspace_id, channel_id, message_ts, thread_ts, user_id, subtype, text, event_payload, observed_at)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, now())`,
-        [eventId, eventSequence, workspaceId, event.channel, event.ts,
-          typeof event.thread_ts === "string" ? event.thread_ts : null,
-          typeof event.user === "string" ? event.user : null,
-          typeof event.subtype === "string" ? event.subtype : null,
-          typeof event.text === "string" ? event.text : null, event],
-      );
+      await this.upsertTarget(workspaceId, event.channel);
+      await this.insertMessageIfAbsent(eventId, eventSequence, workspaceId, event.channel, event, new Date().toISOString());
     }
     return { inserted: true, eventSequence };
   }
 
+  async storeHistoryPage(task: BackfillTask, messages: SlackHistoryMessage[]): Promise<void> {
+    const client = await this.pool.connect();
+    try {
+      await client.query("BEGIN");
+      // Slack history pages are newest-first; sequence numbers are the agent's cursor,
+      // so write the page oldest-first to keep a new backfill digest chronological.
+      for (const message of [...messages].sort(compareSlackTimestamp)) {
+        if (message.type && message.type !== "message") continue;
+        const eventId = historyEventId(task.workspaceId, task.channelId, message.ts);
+        const inserted = await client.query<{ event_sequence: string }>(
+          `INSERT INTO slack_events (event_id, workspace_id, callback_type, event_type, event_ts, payload)
+           VALUES ($1, $2, 'history_backfill', 'message', $3, $4) ON CONFLICT (event_id) DO NOTHING RETURNING event_sequence`,
+          [eventId, task.workspaceId, message.ts, message],
+        );
+        if (inserted.rowCount) await this.insertMessageIfAbsent(eventId, Number(inserted.rows[0].event_sequence), task.workspaceId, task.channelId, message, new Date().toISOString(), client);
+        // conversations.history normally contains root messages only; keep this guard so a
+        // future Slack response variant can never turn a reply into a separate root index.
+        if (typeof message.thread_ts === "string") continue;
+        const replyCount = numberValue(message.reply_count) ?? 0;
+        const latestReply = stringValue(message.latest_reply);
+        const index = await client.query<{ fetched_reply_count: number }>(
+          `INSERT INTO thread_index (workspace_id, channel_id, root_ts, observed_reply_count, latest_reply_ts, indexed_at)
+           VALUES ($1, $2, $3, $4, $5, now())
+           ON CONFLICT (workspace_id, channel_id, root_ts) DO UPDATE
+             SET observed_reply_count = EXCLUDED.observed_reply_count, latest_reply_ts = EXCLUDED.latest_reply_ts, indexed_at = now()
+           RETURNING fetched_reply_count`,
+          [task.workspaceId, task.channelId, message.ts, replyCount, latestReply],
+        );
+        if (replyCount > index.rows[0].fetched_reply_count) {
+          await client.query(
+            `INSERT INTO backfill_tasks (job_id, workspace_id, channel_id, phase, root_ts, oldest, latest)
+             VALUES ($1, $2, $3, 'replies', $4, $5, $6) ON CONFLICT DO NOTHING`,
+            [task.jobId, task.workspaceId, task.channelId, message.ts, task.oldest, task.latest],
+          );
+        }
+      }
+      await client.query("COMMIT");
+    } catch (error) { await client.query("ROLLBACK"); throw error; } finally { client.release(); }
+  }
+
+  async storeReplies(task: BackfillTask, messages: SlackHistoryMessage[]): Promise<void> {
+    if (!task.rootTs) throw new Error("Reply task is missing root_ts");
+    const client = await this.pool.connect();
+    try {
+      await client.query("BEGIN");
+      for (const message of [...messages].sort(compareSlackTimestamp)) {
+        if (message.type && message.type !== "message") continue;
+        const eventId = historyEventId(task.workspaceId, task.channelId, message.ts);
+        const inserted = await client.query<{ event_sequence: string }>(
+          `INSERT INTO slack_events (event_id, workspace_id, callback_type, event_type, event_ts, payload)
+           VALUES ($1, $2, 'thread_backfill', 'message', $3, $4) ON CONFLICT (event_id) DO NOTHING RETURNING event_sequence`,
+          [eventId, task.workspaceId, message.ts, message],
+        );
+        if (inserted.rowCount) await this.insertMessageIfAbsent(eventId, Number(inserted.rows[0].event_sequence), task.workspaceId, task.channelId, message, new Date().toISOString(), client);
+      }
+      await client.query(
+        `UPDATE thread_index SET fetched_reply_count = observed_reply_count, fetched_at = now()
+         WHERE workspace_id = $1 AND channel_id = $2 AND root_ts = $3`, [task.workspaceId, task.channelId, task.rootTs],
+      );
+      await client.query("COMMIT");
+    } catch (error) { await client.query("ROLLBACK"); throw error; } finally { client.release(); }
+  }
+
+  async threadNeedsRefresh(task: BackfillTask): Promise<boolean> {
+    if (!task.rootTs) return false;
+    const result = await this.pool.query<{ needed: boolean }>(
+      `SELECT observed_reply_count > fetched_reply_count AS needed FROM thread_index WHERE workspace_id = $1 AND channel_id = $2 AND root_ts = $3`,
+      [task.workspaceId, task.channelId, task.rootTs],
+    );
+    return result.rows[0]?.needed === true;
+  }
+
+  async createBackfillJob(kind: "initial" | "manual" | "downtime", startAt: Date, endAt: Date, retentionDays: number): Promise<{ job: BackfillJob; targetCount: number }> {
+    if (startAt >= endAt) throw new Error("Backfill start must be before end");
+    const client = await this.pool.connect();
+    try {
+      await client.query("BEGIN");
+      const targets = await client.query<{ workspace_id: string; channel_id: string }>("SELECT workspace_id, channel_id FROM observation_targets WHERE enabled ORDER BY workspace_id, channel_id");
+      const job = await client.query<{ id: string }>(
+        `INSERT INTO backfill_jobs (kind, requested_start_at, requested_end_at) VALUES ($1, $2, $3) RETURNING id`, [kind, startAt, endAt],
+      );
+      const scanStart = new Date(endAt.getTime() - retentionDays * 86_400_000).toISOString();
+      for (const target of targets.rows) {
+        await client.query(
+          `INSERT INTO backfill_tasks (job_id, workspace_id, channel_id, phase, oldest, latest) VALUES ($1, $2, $3, 'history', $4, $5)`,
+          [job.rows[0].id, target.workspace_id, target.channel_id, scanStart, endAt.toISOString()],
+        );
+      }
+      if (!targets.rowCount) await client.query(`UPDATE backfill_jobs SET state = 'completed', completed_at = now(), updated_at = now() WHERE id = $1`, [job.rows[0].id]);
+      await client.query("COMMIT");
+      return { job: await this.getBackfillJob(Number(job.rows[0].id)), targetCount: targets.rowCount ?? 0 };
+    } catch (error) { await client.query("ROLLBACK"); throw error; } finally { client.release(); }
+  }
+
+  async addObservationTarget(workspaceId: string, channelId: string): Promise<void> { await this.upsertTarget(workspaceId, channelId); }
+  async setObservationTargetEnabled(workspaceId: string, channelId: string, enabled: boolean): Promise<void> {
+    await this.pool.query(`UPDATE observation_targets SET enabled = $3, updated_at = now() WHERE workspace_id = $1 AND channel_id = $2`, [workspaceId, channelId, enabled]);
+  }
+
+  async claimBackfillTask(): Promise<BackfillTask | null> {
+    const result = await this.pool.query<TaskRow>(
+      `WITH candidate AS (
+         SELECT t.id FROM backfill_tasks t JOIN backfill_jobs j ON j.id = t.job_id
+         WHERE t.state IN ('queued', 'retry') AND j.state IN ('queued', 'running')
+           AND (t.not_before IS NULL OR t.not_before <= now())
+         ORDER BY t.id FOR UPDATE SKIP LOCKED LIMIT 1
+       )
+       UPDATE backfill_tasks t SET state = 'running', attempts = attempts + 1, updated_at = now()
+       FROM candidate WHERE t.id = candidate.id
+       RETURNING t.id::text, t.job_id::text, t.workspace_id, t.channel_id, t.phase, t.cursor, t.root_ts, t.oldest, t.latest, t.attempts`,
+    );
+    if (!result.rowCount) return null;
+    await this.pool.query(`UPDATE backfill_jobs SET state = 'running', updated_at = now() WHERE id = $1 AND state = 'queued'`, [result.rows[0].job_id]);
+    return toTask(result.rows[0]);
+  }
+
+  async completeHistoryTask(taskId: number, cursor: string | null): Promise<void> {
+    const statement = historyCheckpointStatement(taskId, cursor);
+    await this.pool.query(statement.text, statement.values);
+    await this.finishJobIfDone(taskId);
+  }
+  async completeBackfillTask(taskId: number): Promise<void> {
+    await this.pool.query(`UPDATE backfill_tasks SET state = 'completed', completed_at = now(), updated_at = now(), last_error = NULL WHERE id = $1`, [taskId]);
+    await this.finishJobIfDone(taskId);
+  }
+  async retryBackfillTask(taskId: number, error: string, retryAt: Date): Promise<void> {
+    await this.pool.query(`UPDATE backfill_tasks SET state = 'retry', not_before = $2, last_error = $3, updated_at = now() WHERE id = $1`, [taskId, retryAt, error]);
+    await this.pool.query(`UPDATE backfill_jobs SET last_error = $2, updated_at = now() WHERE id = (SELECT job_id FROM backfill_tasks WHERE id = $1)`, [taskId, error]);
+  }
+  async cancelBackfillJob(jobId: number): Promise<void> {
+    await this.pool.query(`UPDATE backfill_jobs SET state = 'canceled', updated_at = now() WHERE id = $1 AND state IN ('queued', 'running')`, [jobId]);
+    await this.pool.query(`UPDATE backfill_tasks SET state = 'canceled', updated_at = now() WHERE job_id = $1 AND state IN ('queued', 'retry')`, [jobId]);
+  }
+  async backfillRuntime(): Promise<{ nextRequestAt: string | null }> {
+    const result = await this.pool.query<{ next_request_at: string | null }>("SELECT next_request_at::text FROM backfill_runtime WHERE singleton");
+    return { nextRequestAt: result.rows[0].next_request_at };
+  }
+  async setBackfillRuntime(nextRequestAt: Date, error: string | null = null): Promise<void> {
+    await this.pool.query(`UPDATE backfill_runtime SET next_request_at = $1, last_error = $2, updated_at = now() WHERE singleton`, [nextRequestAt, error]);
+  }
+
+  async markSocketConnected(minGapSeconds: number): Promise<void> {
+    const result = await this.pool.query<{ checkpoint: string | null }>(
+      `SELECT COALESCE(last_disconnected_at, last_event_at, last_connected_at)::text AS checkpoint FROM observer_health WHERE singleton`,
+    );
+    const checkpoint = result.rows[0].checkpoint;
+    if (checkpoint && Date.now() - new Date(checkpoint).getTime() >= minGapSeconds * 1000) {
+      await this.pool.query(`INSERT INTO backfill_suggestions (start_at, end_at) VALUES ($1, now()) ON CONFLICT DO NOTHING`, [checkpoint]);
+    }
+    await this.pool.query(`UPDATE observer_health SET socket_state = 'connected', last_connected_at = now(), updated_at = now() WHERE singleton`);
+  }
+  async markSocketDisconnected(): Promise<void> { await this.pool.query(`UPDATE observer_health SET socket_state = 'disconnected', last_disconnected_at = now(), updated_at = now() WHERE singleton`); }
+  async markSocketEvent(): Promise<void> { await this.pool.query(`UPDATE observer_health SET last_event_at = now(), updated_at = now() WHERE singleton`); }
+  async listBackfillSuggestions(): Promise<Array<{ id: number; startAt: string; endAt: string }>> {
+    const result = await this.pool.query<{ id: string; start_at: string; end_at: string }>(`SELECT id::text, start_at::text, end_at::text FROM backfill_suggestions WHERE state = 'pending' ORDER BY start_at DESC`);
+    return result.rows.map((row) => ({ id: Number(row.id), startAt: row.start_at, endAt: row.end_at }));
+  }
+  async acceptBackfillSuggestion(id: number, retentionDays: number): Promise<{ job: BackfillJob; targetCount: number }> {
+    const item = await this.pool.query<{ start_at: string; end_at: string }>(`UPDATE backfill_suggestions SET state = 'accepted' WHERE id = $1 AND state = 'pending' RETURNING start_at::text, end_at::text`, [id]);
+    if (!item.rowCount) throw new Error("Backfill suggestion is unavailable");
+    return this.createBackfillJob("downtime", new Date(item.rows[0].start_at), new Date(item.rows[0].end_at), retentionDays);
+  }
+  async dismissBackfillSuggestion(id: number): Promise<void> { await this.pool.query(`UPDATE backfill_suggestions SET state = 'dismissed' WHERE id = $1 AND state = 'pending'`, [id]); }
+
+  async purgeExpired(rawEventRetentionDays: number, messageRetentionDays: number): Promise<void> {
+    await this.pool.query(`DELETE FROM slack_events WHERE received_at < now() - make_interval(days => $1)`, [rawEventRetentionDays]);
+    await this.pool.query(
+      `DELETE FROM messages m WHERE to_timestamp(m.message_ts::double precision) < now() - make_interval(days => $1)
+       AND NOT EXISTS (SELECT 1 FROM messages recent WHERE recent.workspace_id = m.workspace_id AND recent.channel_id = m.channel_id
+         AND recent.thread_ts = m.message_ts AND to_timestamp(recent.message_ts::double precision) >= now() - make_interval(days => $1))`, [messageRetentionDays],
+    );
+    await this.pool.query(
+      `DELETE FROM thread_index i WHERE NOT EXISTS (SELECT 1 FROM messages m WHERE m.workspace_id = i.workspace_id AND m.channel_id = i.channel_id AND m.message_ts = i.root_ts)`,
+    );
+  }
+
   async latestSequence(): Promise<number> {
-    const result = await this.pool.query<{ value: string }>("SELECT COALESCE(MAX(event_sequence), 0)::text AS value FROM slack_events");
+    const result = await this.pool.query<{ value: string }>("SELECT COALESCE(MAX(event_sequence), 0)::text AS value FROM messages");
     return Number(result.rows[0].value);
   }
-
   async changedMessages(afterSequence: number, upperSequence: number, settleSeconds: number): Promise<StoredMessage[]> {
-    const result = await this.pool.query<MessageRow>(
-      `SELECT m.event_id, m.event_sequence::text, m.workspace_id, m.channel_id, m.message_ts, m.thread_ts, m.user_id, m.subtype, m.text, m.event_payload, m.observed_at::text,
-              wm.workspace_name, cm.channel_name
-       FROM messages m LEFT JOIN workspace_metadata wm USING (workspace_id)
-       LEFT JOIN channel_metadata cm USING (workspace_id, channel_id)
-       WHERE m.event_sequence > $1 AND m.event_sequence <= $2
-         AND m.observed_at <= now() - make_interval(secs => $3)
-       ORDER BY m.event_sequence ASC`,
-      [afterSequence, upperSequence, settleSeconds],
-    );
+    const result = await this.pool.query<MessageRow>(`${messageSelect}
+       WHERE m.event_sequence > $1 AND m.event_sequence <= $2 AND m.observed_at <= now() - make_interval(secs => $3) ORDER BY m.event_sequence ASC`, [afterSequence, upperSequence, settleSeconds]);
     return result.rows.map(toStoredMessage);
   }
-
-  /** Returns the complete observed history for each touched thread. It performs no Slack API call. */
+  async pendingMessages(consumerId: string, upperSequence: number, settleSeconds: number): Promise<StoredMessage[]> {
+    const result = await this.pool.query<MessageRow>(`${messageSelect}
+       WHERE m.event_sequence <= $1 AND m.observed_at <= now() - make_interval(secs => $2)
+       AND NOT EXISTS (SELECT 1 FROM consumer_message_acks a WHERE a.consumer_id = $3 AND a.event_id = m.event_id)
+       ORDER BY m.event_sequence ASC`, [upperSequence, settleSeconds, consumerId]);
+    return result.rows.map(toStoredMessage);
+  }
+  async acknowledgeMessages(consumerId: string, eventIds: string[]): Promise<{ acknowledgedEventIds: string[]; alreadyAcknowledgedEventIds: string[]; unknownEventIds: string[] }> {
+    const uniqueEventIds = [...new Set(eventIds)];
+    const result = await this.pool.query<{ event_id: string; is_known: boolean; inserted: boolean }>(
+      `WITH input AS (SELECT DISTINCT unnest($2::text[]) AS event_id),
+       known AS (SELECT input.event_id FROM input JOIN messages m USING (event_id)),
+       inserted AS (
+         INSERT INTO consumer_message_acks (consumer_id, event_id)
+         SELECT $1, event_id FROM known ON CONFLICT DO NOTHING RETURNING event_id
+       )
+       SELECT input.event_id, EXISTS (SELECT 1 FROM known WHERE known.event_id = input.event_id) AS is_known,
+         EXISTS (SELECT 1 FROM inserted WHERE inserted.event_id = input.event_id) AS inserted
+       FROM input`, [consumerId, uniqueEventIds],
+    );
+    return {
+      acknowledgedEventIds: result.rows.filter((row) => row.inserted).map((row) => row.event_id),
+      alreadyAcknowledgedEventIds: result.rows.filter((row) => row.is_known && !row.inserted).map((row) => row.event_id),
+      unknownEventIds: result.rows.filter((row) => !row.is_known).map((row) => row.event_id),
+    };
+  }
+  /** Returns the complete locally retained history for each touched thread. It performs no Slack API call. */
   async hydrateThreads(changed: StoredMessage[]): Promise<StoredMessage[]> {
-    const threadKeys = [...new Map(
-      changed.filter((message) => message.threadTs).map((message) => [`${message.workspaceId}\u0000${message.channelId}\u0000${message.threadTs}`, message]),
-    ).values()];
-    if (threadKeys.length === 0) return changed;
-    const clauses: string[] = [];
-    const values: string[] = [];
-    for (const item of threadKeys) {
-      const index = values.length;
-      values.push(item.workspaceId, item.channelId, item.threadTs!);
-      clauses.push(`(workspace_id = $${index + 1} AND channel_id = $${index + 2} AND (thread_ts = $${index + 3} OR message_ts = $${index + 3}))`);
-    }
-    const result = await this.pool.query<MessageRow>(
-      `SELECT m.event_id, m.event_sequence::text, m.workspace_id, m.channel_id, m.message_ts, m.thread_ts, m.user_id, m.subtype, m.text, m.event_payload, m.observed_at::text,
-              wm.workspace_name, cm.channel_name
-       FROM messages m LEFT JOIN workspace_metadata wm USING (workspace_id)
-       LEFT JOIN channel_metadata cm USING (workspace_id, channel_id)
-       WHERE ${clauses.map((clause) => clause.replaceAll("workspace_id", "m.workspace_id").replaceAll("channel_id", "m.channel_id").replaceAll("thread_ts", "m.thread_ts").replaceAll("message_ts", "m.message_ts")).join(" OR ")}
-       ORDER BY m.event_sequence ASC`, values,
-    );
-    const byEventId = new Map<string, StoredMessage>();
-    for (const message of [...changed, ...result.rows.map(toStoredMessage)]) byEventId.set(message.eventId, message);
-    return [...byEventId.values()].sort((a, b) => a.eventSequence - b.eventSequence);
+    const keys = [...new Map(changed.filter((item) => item.threadTs).map((item) => [`${item.workspaceId}\u0000${item.channelId}\u0000${item.threadTs}`, item])).values()];
+    if (!keys.length) return changed;
+    const values: string[] = []; const clauses = keys.map((item) => { const index = values.length; values.push(item.workspaceId, item.channelId, item.threadTs!); return `(m.workspace_id = $${index + 1} AND m.channel_id = $${index + 2} AND (m.thread_ts = $${index + 3} OR m.message_ts = $${index + 3}))`; });
+    const result = await this.pool.query<MessageRow>(`${messageSelect} WHERE ${clauses.join(" OR ")} ORDER BY m.event_sequence ASC`, values);
+    const byId = new Map<string, StoredMessage>(); for (const message of [...changed, ...result.rows.map(toStoredMessage)]) byId.set(message.eventId, message);
+    return [...byId.values()].sort((a, b) => a.eventSequence - b.eventSequence);
   }
-
   async getThread(workspaceId: string, channelId: string, threadTs: string, afterMessageTs: string | undefined, settleSeconds: number): Promise<StoredMessage[]> {
-    const result = await this.pool.query<MessageRow>(
-      `SELECT m.event_id, m.event_sequence::text, m.workspace_id, m.channel_id, m.message_ts, m.thread_ts, m.user_id, m.subtype, m.text, m.event_payload, m.observed_at::text,
-              wm.workspace_name, cm.channel_name
-       FROM messages m LEFT JOIN workspace_metadata wm USING (workspace_id)
-       LEFT JOIN channel_metadata cm USING (workspace_id, channel_id)
-       WHERE m.workspace_id = $1 AND m.channel_id = $2 AND (m.thread_ts = $3 OR m.message_ts = $3)
-         AND m.observed_at <= now() - make_interval(secs => $4)
-       ORDER BY m.message_ts ASC`,
-      [workspaceId, channelId, threadTs, settleSeconds],
-    );
-    const messages = result.rows.map(toStoredMessage);
-    if (!afterMessageTs) return messages;
-    const root = messages.find((message) => message.messageTs === threadTs);
-    return [...(root ? [root] : []), ...messages.filter((message) => message.messageTs > afterMessageTs && message.messageTs !== threadTs)];
+    const result = await this.pool.query<MessageRow>(`${messageSelect} WHERE m.workspace_id = $1 AND m.channel_id = $2 AND (m.thread_ts = $3 OR m.message_ts = $3) AND m.observed_at <= now() - make_interval(secs => $4) ORDER BY m.message_ts ASC`, [workspaceId, channelId, threadTs, settleSeconds]);
+    const messages = result.rows.map(toStoredMessage); if (!afterMessageTs) return messages;
+    const root = messages.find((item) => item.messageTs === threadTs); return [...(root ? [root] : []), ...messages.filter((item) => item.messageTs > afterMessageTs && item.messageTs !== threadTs)];
   }
 
-  async listChannels(): Promise<Array<{ workspaceId: string; workspaceName: string | null; channelId: string; channelName: string | null; messageCount: number; lastObservedAt: string }>> {
-    const result = await this.pool.query<{ workspace_id: string; workspace_name: string | null; channel_id: string; channel_name: string | null; message_count: string; last_observed_at: string }>(
-      `SELECT m.workspace_id, wm.workspace_name, m.channel_id, cm.channel_name, count(*)::text AS message_count, max(m.observed_at)::text AS last_observed_at
-       FROM messages m LEFT JOIN workspace_metadata wm USING (workspace_id)
-       LEFT JOIN channel_metadata cm USING (workspace_id, channel_id)
-       GROUP BY m.workspace_id, wm.workspace_name, m.channel_id, cm.channel_name ORDER BY last_observed_at DESC`,
+  async listChannels(): Promise<Array<{ workspaceId: string; workspaceName: string | null; channelId: string; channelName: string | null; enabled: boolean; messageCount: number; lastObservedAt: string | null }>> {
+    const result = await this.pool.query<ChannelRow>(
+      `SELECT t.workspace_id, wm.workspace_name, t.channel_id, cm.channel_name, t.enabled, count(m.event_id)::text AS message_count, max(m.observed_at)::text AS last_observed_at
+       FROM observation_targets t LEFT JOIN messages m ON m.workspace_id = t.workspace_id AND m.channel_id = t.channel_id
+       LEFT JOIN workspace_metadata wm ON wm.workspace_id = t.workspace_id LEFT JOIN channel_metadata cm ON cm.workspace_id = t.workspace_id AND cm.channel_id = t.channel_id
+       GROUP BY t.workspace_id, wm.workspace_name, t.channel_id, cm.channel_name, t.enabled ORDER BY max(m.observed_at) DESC NULLS LAST, t.channel_id`,
     );
-    return result.rows.map((row) => ({ workspaceId: row.workspace_id, workspaceName: row.workspace_name, channelId: row.channel_id, channelName: row.channel_name, messageCount: Number(row.message_count), lastObservedAt: row.last_observed_at }));
+    return result.rows.map((row) => ({ workspaceId: row.workspace_id, workspaceName: row.workspace_name, channelId: row.channel_id, channelName: row.channel_name, enabled: row.enabled, messageCount: Number(row.message_count), lastObservedAt: row.last_observed_at }));
   }
-
   async metadataLookupDue(workspaceId: string, channelId: string, maxAgeHours = 24): Promise<{ workspace: boolean; channel: boolean }> {
     const result = await this.pool.query<{ workspace_due: boolean; channel_due: boolean }>(
       `SELECT NOT EXISTS (SELECT 1 FROM workspace_metadata WHERE workspace_id = $1 AND ((workspace_name IS NOT NULL AND last_synced_at > now() - make_interval(hours => $3)) OR last_attempted_at > now() - interval '15 minutes')) AS workspace_due,
-              NOT EXISTS (SELECT 1 FROM channel_metadata WHERE workspace_id = $1 AND channel_id = $2 AND ((channel_name IS NOT NULL AND last_synced_at > now() - make_interval(hours => $3)) OR last_attempted_at > now() - interval '15 minutes')) AS channel_due`,
-      [workspaceId, channelId, maxAgeHours],
-    );
+       NOT EXISTS (SELECT 1 FROM channel_metadata WHERE workspace_id = $1 AND channel_id = $2 AND ((channel_name IS NOT NULL AND last_synced_at > now() - make_interval(hours => $3)) OR last_attempted_at > now() - interval '15 minutes')) AS channel_due`, [workspaceId, channelId, maxAgeHours]);
     return { workspace: result.rows[0].workspace_due, channel: result.rows[0].channel_due };
   }
-
-  async saveWorkspaceMetadata(workspaceId: string, workspaceName: string): Promise<void> {
-    await this.pool.query(
-      `INSERT INTO workspace_metadata (workspace_id, workspace_name, last_synced_at, last_attempted_at, last_error)
-       VALUES ($1, $2, now(), now(), NULL)
-       ON CONFLICT (workspace_id) DO UPDATE SET workspace_name = EXCLUDED.workspace_name, last_synced_at = now(), last_attempted_at = now(), last_error = NULL`,
-      [workspaceId, workspaceName],
-    );
-  }
-
-  async saveChannelMetadata(workspaceId: string, channelId: string, channelName: string): Promise<void> {
-    await this.pool.query(
-      `INSERT INTO channel_metadata (workspace_id, channel_id, channel_name, last_synced_at, last_attempted_at, last_error)
-       VALUES ($1, $2, $3, now(), now(), NULL)
-       ON CONFLICT (workspace_id, channel_id) DO UPDATE SET channel_name = EXCLUDED.channel_name, last_synced_at = now(), last_attempted_at = now(), last_error = NULL`,
-      [workspaceId, channelId, channelName],
-    );
-  }
-
+  async saveWorkspaceMetadata(workspaceId: string, workspaceName: string): Promise<void> { await this.pool.query(`INSERT INTO workspace_metadata (workspace_id, workspace_name, last_synced_at, last_attempted_at, last_error) VALUES ($1, $2, now(), now(), NULL) ON CONFLICT (workspace_id) DO UPDATE SET workspace_name = EXCLUDED.workspace_name, last_synced_at = now(), last_attempted_at = now(), last_error = NULL`, [workspaceId, workspaceName]); }
+  async saveChannelMetadata(workspaceId: string, channelId: string, channelName: string): Promise<void> { await this.pool.query(`INSERT INTO channel_metadata (workspace_id, channel_id, channel_name, last_synced_at, last_attempted_at, last_error) VALUES ($1, $2, $3, now(), now(), NULL) ON CONFLICT (workspace_id, channel_id) DO UPDATE SET channel_name = EXCLUDED.channel_name, last_synced_at = now(), last_attempted_at = now(), last_error = NULL`, [workspaceId, channelId, channelName]); }
   async saveMetadataError(workspaceId: string, channelId: string, error: string): Promise<void> {
-    await this.pool.query(
-      `INSERT INTO workspace_metadata (workspace_id, last_attempted_at, last_error)
-       VALUES ($1, now(), $2)
-       ON CONFLICT (workspace_id) DO UPDATE SET last_attempted_at = now(), last_error = EXCLUDED.last_error`,
-      [workspaceId, error],
-    );
-    await this.pool.query(
-      `INSERT INTO channel_metadata (workspace_id, channel_id, last_attempted_at, last_error)
-       VALUES ($1, $2, now(), $3)
-       ON CONFLICT (workspace_id, channel_id) DO UPDATE SET last_attempted_at = now(), last_error = EXCLUDED.last_error`,
-      [workspaceId, channelId, error],
-    );
+    await this.pool.query(`INSERT INTO workspace_metadata (workspace_id, last_attempted_at, last_error) VALUES ($1, now(), $2) ON CONFLICT (workspace_id) DO UPDATE SET last_attempted_at = now(), last_error = EXCLUDED.last_error`, [workspaceId, error]);
+    await this.pool.query(`INSERT INTO channel_metadata (workspace_id, channel_id, last_attempted_at, last_error) VALUES ($1, $2, now(), $3) ON CONFLICT (workspace_id, channel_id) DO UPDATE SET last_attempted_at = now(), last_error = EXCLUDED.last_error`, [workspaceId, channelId, error]);
   }
-
-  async dashboardStatus(): Promise<{ events: number; messages: number; lastReceivedAt: string | null; channels: number }> {
-    const result = await this.pool.query<{ events: string; messages: string; last_received_at: string | null; channels: string }>(
-      `SELECT (SELECT count(*) FROM slack_events)::text AS events,
-              (SELECT count(*) FROM messages)::text AS messages,
-              (SELECT max(received_at)::text FROM slack_events) AS last_received_at,
-              (SELECT count(DISTINCT (workspace_id, channel_id)) FROM messages)::text AS channels`,
-    );
-    const row = result.rows[0];
-    return { events: Number(row.events), messages: Number(row.messages), lastReceivedAt: row.last_received_at, channels: Number(row.channels) };
+  async listBackfillJobs(): Promise<BackfillJob[]> {
+    const result = await this.pool.query<JobRow>(`SELECT j.id::text, j.kind, j.state, j.requested_start_at::text, j.requested_end_at::text, j.created_at::text, j.completed_at::text, j.last_error,
+      count(DISTINCT (t.workspace_id, t.channel_id))::text AS channels, count(*) FILTER (WHERE t.state = 'completed')::text AS completed_tasks, count(*)::text AS total_tasks,
+      count(*) FILTER (WHERE t.phase = 'history')::text AS history_tasks, count(*) FILTER (WHERE t.phase = 'replies')::text AS reply_tasks
+      FROM backfill_jobs j LEFT JOIN backfill_tasks t ON t.job_id = j.id GROUP BY j.id ORDER BY j.id DESC LIMIT 20`);
+    return result.rows.map(toJob);
   }
-
+  async dashboardStatus(): Promise<{ events: number; messages: number; lastReceivedAt: string | null; channels: number; earliestMessageAt: string | null; nextBackfillRequestAt: string | null }> {
+    const result = await this.pool.query<{ events: string; messages: string; last_received_at: string | null; channels: string; earliest_message_at: string | null; next_request_at: string | null }>(
+      `SELECT (SELECT count(*) FROM slack_events)::text AS events, (SELECT count(*) FROM messages)::text AS messages,
+       (SELECT max(received_at)::text FROM slack_events) AS last_received_at, (SELECT count(*) FROM observation_targets WHERE enabled)::text AS channels,
+       (SELECT min(to_timestamp(message_ts::double precision))::text FROM messages) AS earliest_message_at,
+       (SELECT next_request_at::text FROM backfill_runtime WHERE singleton) AS next_request_at`);
+    const row = result.rows[0]; return { events: Number(row.events), messages: Number(row.messages), lastReceivedAt: row.last_received_at, channels: Number(row.channels), earliestMessageAt: row.earliest_message_at, nextBackfillRequestAt: row.next_request_at };
+  }
   async close(): Promise<void> { await this.pool.end(); }
+
+  private async upsertTarget(workspaceId: string, channelId: string): Promise<void> { await this.pool.query(`INSERT INTO observation_targets (workspace_id, channel_id) VALUES ($1, $2) ON CONFLICT (workspace_id, channel_id) DO UPDATE SET updated_at = now()`, [workspaceId, channelId]); }
+  private async insertMessageIfAbsent(eventId: string, eventSequence: number, workspaceId: string, channelId: string, message: Record<string, unknown>, observedAt: string, client: Pool | PoolClient = this.pool): Promise<void> {
+    const exists = await client.query<{ event_id: string }>(`SELECT event_id FROM messages WHERE workspace_id = $1 AND channel_id = $2 AND message_ts = $3 LIMIT 1`, [workspaceId, channelId, message.ts]);
+    if (exists.rowCount) return;
+    await client.query(`INSERT INTO messages (event_id, event_sequence, workspace_id, channel_id, message_ts, thread_ts, user_id, subtype, text, event_payload, observed_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)`, [eventId, eventSequence, workspaceId, channelId, message.ts, stringValue(message.thread_ts), stringValue(message.user), stringValue(message.subtype), stringValue(message.text), message, observedAt]);
+  }
+  private async finishJobIfDone(taskId: number): Promise<void> { await this.pool.query(`UPDATE backfill_jobs j SET state = 'completed', completed_at = now(), updated_at = now() WHERE j.id = (SELECT job_id FROM backfill_tasks WHERE id = $1) AND NOT EXISTS (SELECT 1 FROM backfill_tasks t WHERE t.job_id = j.id AND t.state NOT IN ('completed', 'canceled'))`, [taskId]); }
+  private async getBackfillJob(id: number): Promise<BackfillJob> { const jobs = await this.pool.query<JobRow>(`SELECT j.id::text, j.kind, j.state, j.requested_start_at::text, j.requested_end_at::text, j.created_at::text, j.completed_at::text, j.last_error, count(DISTINCT (t.workspace_id, t.channel_id))::text AS channels, count(*) FILTER (WHERE t.state = 'completed')::text AS completed_tasks, count(*)::text AS total_tasks, count(*) FILTER (WHERE t.phase = 'history')::text AS history_tasks, count(*) FILTER (WHERE t.phase = 'replies')::text AS reply_tasks FROM backfill_jobs j LEFT JOIN backfill_tasks t ON t.job_id = j.id WHERE j.id = $1 GROUP BY j.id`, [id]); return toJob(jobs.rows[0]); }
 }
 
-type MessageRow = {
-  event_id: string; event_sequence: string; workspace_id: string; channel_id: string; message_ts: string; thread_ts: string | null;
-  user_id: string | null; subtype: string | null; text: string | null; event_payload: Record<string, unknown>; observed_at: string; workspace_name: string | null; channel_name: string | null;
-};
+const messageSelect = `SELECT m.event_id, m.event_sequence::text, m.workspace_id, m.channel_id, m.message_ts, m.thread_ts, m.user_id, m.subtype, m.text, m.event_payload, m.observed_at::text, wm.workspace_name, cm.channel_name FROM messages m LEFT JOIN workspace_metadata wm USING (workspace_id) LEFT JOIN channel_metadata cm USING (workspace_id, channel_id)`;
+type MessageRow = { event_id: string; event_sequence: string; workspace_id: string; channel_id: string; message_ts: string; thread_ts: string | null; user_id: string | null; subtype: string | null; text: string | null; event_payload: Record<string, unknown>; observed_at: string; workspace_name: string | null; channel_name: string | null };
+type TaskRow = { id: string; job_id: string; workspace_id: string; channel_id: string; phase: "history" | "replies"; cursor: string | null; root_ts: string | null; oldest: string; latest: string; attempts: number };
+type ChannelRow = { workspace_id: string; workspace_name: string | null; channel_id: string; channel_name: string | null; enabled: boolean; message_count: string; last_observed_at: string | null };
+type JobRow = { id: string; kind: "initial" | "manual" | "downtime"; state: string; requested_start_at: string; requested_end_at: string; created_at: string; completed_at: string | null; last_error: string | null; channels: string; completed_tasks: string; total_tasks: string; history_tasks: string; reply_tasks: string };
+function toStoredMessage(row: MessageRow): StoredMessage { return { eventId: row.event_id, eventSequence: Number(row.event_sequence), workspaceId: row.workspace_id, channelId: row.channel_id, messageTs: row.message_ts, threadTs: row.thread_ts, userId: row.user_id, subtype: row.subtype, text: row.text, payload: row.event_payload, observedAt: row.observed_at, workspaceName: row.workspace_name, channelName: row.channel_name }; }
+function toTask(row: TaskRow): BackfillTask { return { id: Number(row.id), jobId: Number(row.job_id), workspaceId: row.workspace_id, channelId: row.channel_id, phase: row.phase, cursor: row.cursor, rootTs: row.root_ts, oldest: row.oldest, latest: row.latest, attempts: row.attempts }; }
+function toJob(row: JobRow): BackfillJob { return { id: Number(row.id), kind: row.kind, state: row.state, requestedStartAt: row.requested_start_at, requestedEndAt: row.requested_end_at, createdAt: row.created_at, completedAt: row.completed_at, channels: Number(row.channels), completedTasks: Number(row.completed_tasks), totalTasks: Number(row.total_tasks), historyTasks: Number(row.history_tasks), replyTasks: Number(row.reply_tasks), lastError: row.last_error }; }
+function historyEventId(workspaceId: string, channelId: string, ts: string): string { return `history:${workspaceId}:${channelId}:${ts}`; }
+function stringValue(value: unknown): string | null { return typeof value === "string" ? value : null; }
+function numberValue(value: unknown): number | null { return typeof value === "number" && Number.isInteger(value) && value >= 0 ? value : null; }
+function compareSlackTimestamp(left: SlackHistoryMessage, right: SlackHistoryMessage): number { return Number(left.ts) - Number(right.ts); }
+function isObject(value: unknown): value is Record<string, unknown> { return typeof value === "object" && value !== null && !Array.isArray(value); }
 
-function toStoredMessage(row: MessageRow): StoredMessage {
-  return { eventId: row.event_id, eventSequence: Number(row.event_sequence), workspaceId: row.workspace_id, channelId: row.channel_id,
-    messageTs: row.message_ts, threadTs: row.thread_ts, userId: row.user_id, subtype: row.subtype, text: row.text, payload: row.event_payload, observedAt: row.observed_at,
-    workspaceName: row.workspace_name, channelName: row.channel_name };
-}
-
-function isObject(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
+export function historyCheckpointStatement(taskId: number, cursor: string | null): { text: string; values: Array<number | string> } {
+  if (cursor === null) {
+    return {
+      text: `UPDATE backfill_tasks SET cursor = NULL, state = 'completed', completed_at = now(), updated_at = now(), last_error = NULL WHERE id = $1`,
+      values: [taskId],
+    };
+  }
+  return {
+    text: `UPDATE backfill_tasks SET cursor = $2, state = 'queued', completed_at = NULL, updated_at = now(), last_error = NULL WHERE id = $1`,
+    values: [taskId, cursor],
+  };
 }

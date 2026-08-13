@@ -42,7 +42,9 @@ export function groupMessages(messages: StoredMessage[], channelWindowSeconds = 
   const standaloneByChannel = new Map<string, StoredMessage[]>();
   const rootKeys = new Set(messages.filter((message) => message.threadTs).map((message) => `${message.workspaceId}:${message.channelId}:${message.threadTs}`));
 
-  for (const message of [...messages].sort((a, b) => a.eventSequence - b.eventSequence)) {
+  // Socket delivery and reverse-paginated history backfill are not chronological.
+  // Slack's timestamp is the stable ordering for a channel or thread digest.
+  for (const message of [...messages].sort((a, b) => messageTime(a) - messageTime(b))) {
     // Slack omits thread_ts on the root event; hydrateThreads supplies that root alongside replies.
     const inferredThreadTs = rootKeys.has(`${message.workspaceId}:${message.channelId}:${message.messageTs}`) ? message.messageTs : null;
     const threadTs = message.threadTs ?? inferredThreadTs;
@@ -75,7 +77,7 @@ export function groupMessages(messages: StoredMessage[], channelWindowSeconds = 
     if (window.length) groups.push(makeGroup("channel_window", window));
   }
 
-  return groups.sort((a, b) => a.messages[0].eventSequence - b.messages[0].eventSequence);
+  return groups.sort((a, b) => messageTime(a.messages[0]) - messageTime(b.messages[0]));
 }
 
 /** Packs complete groups where possible. Oversized threads are split only as a last resort,
