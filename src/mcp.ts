@@ -1,5 +1,6 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
+import type { NextFunction, Request, Response } from "express";
 import { z } from "zod";
 import type { Database } from "./db.js";
 import { makeDigestBatch } from "./digest.js";
@@ -83,4 +84,25 @@ export function createMcpTransport(database: Database, defaultSettleSeconds: num
 
   const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined, enableJsonResponse: true });
   return { server, transport, connect: () => server.connect(transport) };
+}
+
+type McpTransportFactory = typeof createMcpTransport;
+
+// Stateless Streamable HTTP transports may serve only one request. Create a
+// fresh server/transport pair for every request so clients can initialize,
+// notify, and discover tools over separate HTTP requests.
+export function createMcpRequestHandler(
+  database: Database,
+  defaultSettleSeconds: number,
+  createTransport: McpTransportFactory = createMcpTransport,
+) {
+  return async (request: Request, response: Response, next: NextFunction) => {
+    try {
+      const { transport, connect } = createTransport(database, defaultSettleSeconds);
+      await connect();
+      await transport.handleRequest(request, response, request.body);
+    } catch (error) {
+      next(error);
+    }
+  };
 }

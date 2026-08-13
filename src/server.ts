@@ -1,7 +1,7 @@
 import express, { type NextFunction, type Request, type Response } from "express";
 import { loadConfig } from "./config.js";
 import { Database } from "./db.js";
-import { createMcpTransport } from "./mcp.js";
+import { createMcpRequestHandler } from "./mcp.js";
 import { SlackMetadataSync } from "./slack-metadata.js";
 import { SocketModeObserver } from "./socket-mode.js";
 
@@ -9,8 +9,6 @@ const config = loadConfig();
 const database = new Database(config.databaseUrl);
 await database.migrate();
 
-const { transport, connect } = createMcpTransport(database, config.threadSettleSeconds);
-await connect();
 const slackMetadata = new SlackMetadataSync(config.slackBotToken, database);
 const slackSocket = new SocketModeObserver(config.slackAppToken, database, (workspaceId, channelId) => slackMetadata.schedule(workspaceId, channelId));
 slackSocket.start();
@@ -27,12 +25,9 @@ function requireBearer(expected: string) {
 }
 
 app.use(express.json({ limit: "1mb" }));
-app.post("/mcp", requireBearer(config.mcpAuthToken), async (request, response, next) => {
-  try { await transport.handleRequest(request, response, request.body); } catch (error) { next(error); }
-});
-app.get("/mcp", requireBearer(config.mcpAuthToken), async (request, response, next) => {
-  try { await transport.handleRequest(request, response); } catch (error) { next(error); }
-});
+const handleMcpRequest = createMcpRequestHandler(database, config.threadSettleSeconds);
+app.post("/mcp", requireBearer(config.mcpAuthToken), handleMcpRequest);
+app.get("/mcp", requireBearer(config.mcpAuthToken), handleMcpRequest);
 
 app.get("/dashboard/status", async (_request, response, next) => {
   try { response.json({ ...(await database.dashboardStatus()), socketMode: slackSocket.status() }); } catch (error) { next(error); }
