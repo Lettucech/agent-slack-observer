@@ -105,15 +105,15 @@ The MCP transport is Streamable HTTP at `/mcp`, protected by the independent age
 
 | Tool | Purpose |
 | --- | --- |
-| `get_digest_batches` | Return observed messages in context-sized groups. With `consumerId`, return only that consumer's unacknowledged inbox. Thread root and replies are grouped together even when unrelated messages were received between them. |
-| `ack_digest` | Mark successfully processed event IDs for one consumer's local inbox. It never changes Slack or deletes retained observer messages. |
-| `get_thread_digest` | Continue a thread that cannot fit in one context window; the root is repeated in each chunk. |
+| `get_digest_batches` | Return one consumer's unacknowledged messages in context-sized groups. Every complete group includes an opaque `ackToken`. |
+| `ack_digest` | Mark one completed delivery receipt with its `ackToken`. It never changes Slack or deletes retained observer messages. |
+| `get_thread_digest` | Continue a thread that cannot fit in one context window; its final chunk includes an `ackToken` for the complete settled thread snapshot. |
 | `list_channels` | List channel IDs that have actually emitted observed messages. |
 | `get_observer_status` | Read local counts and latest-received time. |
 
 `get_digest_batches` takes `maxTokens`, which should be the model context remaining after the agent reserves system prompt, tools, and output tokens. Its tokenizer estimate is intentionally conservative; callers should leave headroom. New messages are held for `THREAD_SETTLE_SECONDS` (90 seconds by default) after the latest activity, reducing the chance of digesting a thread while it is still active.
 
-For the recommended consumer inbox workflow, an agent chooses a stable `consumerId`, calls `get_digest_batches` without `afterSequence`, then calls `ack_digest` only after it has safely completed each group and any required thread continuation. Acknowledgements are idempotent and scoped to that consumer; they do not delete the retained event or message, so thread hydration, retries, and other agents remain safe. A thread with a new reply can intentionally include earlier retained root/context again, which keeps the model from reading a fragment. Legacy callers that omit `consumerId` retain the client-owned `upperSequence` / event-ID de-duplication workflow.
+For the consumer inbox workflow, an agent chooses a stable `consumerId`, calls `get_digest_batches`, then calls `ack_digest` with the opaque `ackToken` returned with each complete group. The server signs a receipt containing the exact event snapshot and consumer, so the agent never constructs IDs or persists a cursor. Acknowledgements are idempotent and scoped to that consumer; they do not delete the retained event or message, so thread hydration, retries, and other agents remain safe. For an oversized thread, the final `get_thread_digest` chunk returns its receipt after all chunks have been read.
 
 ### Agent digest skill
 

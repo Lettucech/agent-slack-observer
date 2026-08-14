@@ -25,6 +25,7 @@ export type DigestGroup = {
   estimatedTokens: number;
   threadTs?: string;
   threadContinues: boolean;
+  ackToken?: string;
 };
 
 export type DigestBatch = {

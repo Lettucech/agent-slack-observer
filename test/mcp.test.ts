@@ -62,10 +62,12 @@ test("uses a consumer inbox without requiring an agent cursor and acknowledges o
   await client.connect(clientTransport);
   try {
     const digest = await client.callTool({ name: "get_digest_batches", arguments: { consumerId: "hermes", afterSequence: 999, maxTokens: 1000 } });
-    assert.equal((digest.structuredContent as { groups: unknown[] }).groups.length, 1);
+    const digestBatch = digest.structuredContent as { groups: Array<{ ackToken?: string }> };
+    assert.equal(digestBatch.groups.length, 1);
+    assert.equal(typeof digestBatch.groups[0].ackToken, "string");
     assert.deepEqual(pendingCalls, [{ consumerId: "hermes", upperSequence: 9, settleSeconds: 90 }]);
 
-    const ack = await client.callTool({ name: "ack_digest", arguments: { consumerId: "hermes", eventIds: ["Ev1"] } });
+    const ack = await client.callTool({ name: "ack_digest", arguments: { ackToken: digestBatch.groups[0].ackToken } });
     assert.deepEqual(ack.structuredContent, { acknowledgedEventIds: ["Ev1"], alreadyAcknowledgedEventIds: [], unknownEventIds: [] });
     assert.deepEqual(acknowledgements, [{ consumerId: "hermes", eventIds: ["Ev1"] }]);
 

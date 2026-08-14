@@ -1,11 +1,12 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import type { NextFunction, Request, Response } from "express";
+import { createHmac, timingSafeEqual } from "node:crypto";
 import { z } from "zod";
 import type { Database } from "./db.js";
 import { makeDigestBatch } from "./digest.js";
 
-export function createMcpTransport(database: Database, defaultSettleSeconds: number) {
+export function createMcpTransport(database: Database, defaultSettleSeconds: number, receiptSecret = "test-only-receipt-secret") {
   const server = new McpServer(
     { name: "agent-slack-observer", version: "0.1.0" },
     { instructions: "This server is read-only with respect to Slack: it observes already-stored Slack Events and never sends Slack messages. A consumer may acknowledge successfully processed events; acknowledgements affect only that consumer's local inbox, never Slack or other consumers. Workspace/channel names are cached local metadata and may briefly be absent or stale." },
@@ -15,26 +16,24 @@ export function createMcpTransport(database: Database, defaultSettleSeconds: num
     "get_digest_batches",
     {
       title: "Get context-aware Slack digest batches",
-      description: "Read observed Slack messages as context-sized batches. Replies in the same Slack thread are returned together even if unrelated messages arrived between them. With consumerId, return that consumer's unacknowledged inbox and ignore afterSequence; acknowledge successfully processed eventIds with ack_digest. Without consumerId, preserve the legacy client-owned afterSequence cursor behavior.",
+      description: "Read one consumer's unacknowledged Slack inbox as context-sized batches. Every complete group has an opaque ackToken; acknowledge it only after digesting the group successfully.",
       inputSchema: {
-        consumerId: z.string().min(1).max(200).optional().describe("Stable name for this digesting consumer. Enables its server-managed inbox; acknowledgements never affect another consumer."),
-        afterSequence: z.number().int().min(0).default(0).describe("Legacy cursor used only when consumerId is omitted. It is ignored for a consumer inbox."),
+        consumerId: z.string().min(1).max(200).describe("Stable name for this digesting consumer. Acknowledgements never affect another consumer."),
         maxTokens: z.number().int().min(128).max(100000).describe("Maximum estimated input tokens for this response."),
         settleSeconds: z.number().int().min(0).max(3600).optional().describe("Ignore a thread that received a message more recently than this duration. Defaults to observer configuration."),
         channelWindowSeconds: z.number().int().min(30).max(3600).optional().describe("How far apart standalone channel messages may be before a new context group begins."),
       },
     },
-    async ({ consumerId, afterSequence, maxTokens, settleSeconds, channelWindowSeconds }) => {
+    async ({ consumerId, maxTokens, settleSeconds, channelWindowSeconds }) => {
       const upperSequence = await database.latestSequence();
       const effectiveSettleSeconds = settleSeconds ?? defaultSettleSeconds;
-      const changed = consumerId
-        ? await database.pendingMessages(consumerId, upperSequence, effectiveSettleSeconds)
-        : await database.changedMessages(afterSequence, upperSequence, effectiveSettleSeconds);
+      const changed = await database.pendingMessages(consumerId, upperSequence, effectiveSettleSeconds);
       const hydrated = await database.hydrateThreads(changed);
       const batch = makeDigestBatch(hydrated, { maxTokens, channelWindowSeconds }, upperSequence);
+      const delivered = addAckTokens(batch, consumerId, new Set(changed.map((message) => message.eventId)), receiptSecret);
       return {
-        content: [{ type: "text", text: JSON.stringify(batch) }],
-        structuredContent: batch,
+        content: [{ type: "text", text: JSON.stringify(delivered) }],
+        structuredContent: delivered,
       };
     },
   );
@@ -43,14 +42,14 @@ export function createMcpTransport(database: Database, defaultSettleSeconds: num
     "ack_digest",
     {
       title: "Acknowledge successfully digested Slack events",
-      description: "Mark supplied eventIds as successfully processed for one consumer's local inbox. This never alters Slack, deletes retained messages, or affects other consumers. Call only after the digest output and any required thread continuation were completed successfully.",
+      description: "Acknowledge one successfully digested delivery receipt. Pass the exact ackToken returned with a complete digest group. This never alters Slack, deletes retained messages, or affects another consumer.",
       inputSchema: {
-        consumerId: z.string().min(1).max(200),
-        eventIds: z.array(z.string().min(1)).min(1).max(1000).describe("Event IDs that this consumer fully digested. Duplicate IDs are safe."),
+        ackToken: z.string().min(1),
       },
     },
-    async ({ consumerId, eventIds }) => {
-      const result = await database.acknowledgeMessages(consumerId, eventIds);
+    async ({ ackToken }) => {
+      const receipt = readReceipt(ackToken, receiptSecret);
+      const result = await database.acknowledgeMessages(receipt.consumerId, receipt.eventIds);
       return { content: [{ type: "text", text: JSON.stringify(result) }], structuredContent: result };
     },
   );
@@ -72,8 +71,9 @@ export function createMcpTransport(database: Database, defaultSettleSeconds: num
     "get_thread_digest",
     {
       title: "Continue a large Slack thread",
-      description: "Read one observed Slack thread in chronological, context-sized chunks. Use this when get_digest_batches marks threadContinues. Every chunk repeats the root message; afterMessageTs advances only inside this thread and is owned by the agent.",
+      description: "Read one observed Slack thread in chronological, context-sized chunks. Use this when get_digest_batches marks threadContinues. Every final chunk has an ackToken covering the whole settled thread snapshot.",
       inputSchema: {
+        consumerId: z.string().min(1).max(200),
         workspaceId: z.string().min(1),
         channelId: z.string().min(1),
         threadTs: z.string().min(1),
@@ -82,10 +82,12 @@ export function createMcpTransport(database: Database, defaultSettleSeconds: num
         settleSeconds: z.number().int().min(0).max(3600).optional(),
       },
     },
-    async ({ workspaceId, channelId, threadTs, afterMessageTs, maxTokens, settleSeconds }) => {
+    async ({ consumerId, workspaceId, channelId, threadTs, afterMessageTs, maxTokens, settleSeconds }) => {
       const messages = await database.getThread(workspaceId, channelId, threadTs, afterMessageTs, settleSeconds ?? defaultSettleSeconds);
       const batch = makeDigestBatch(messages, { maxTokens }, await database.latestSequence());
-      return { content: [{ type: "text", text: JSON.stringify(batch) }], structuredContent: batch };
+      const allMessages = await database.getThread(workspaceId, channelId, threadTs, undefined, settleSeconds ?? defaultSettleSeconds);
+      const delivered = addAckTokens(batch, consumerId, new Set(allMessages.map((message) => message.eventId)), receiptSecret);
+      return { content: [{ type: "text", text: JSON.stringify(delivered) }], structuredContent: delivered };
     },
   );
 
@@ -104,6 +106,32 @@ export function createMcpTransport(database: Database, defaultSettleSeconds: num
 
   const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined, enableJsonResponse: true });
   return { server, transport, connect: () => server.connect(transport) };
+}
+
+const RECEIPT_TTL_MS = 7 * 24 * 60 * 60 * 1000;
+type Receipt = { consumerId: string; eventIds: string[]; expiresAt: number };
+function addAckTokens(batch: ReturnType<typeof makeDigestBatch>, consumerId: string, eligibleEventIds: Set<string>, secret: string) {
+  return { ...batch, groups: batch.groups.map((group) => {
+    if (group.threadContinues) return group;
+    const eventIds = group.messages.map((message) => message.eventId).filter((eventId) => eligibleEventIds.has(eventId));
+    return eventIds.length ? { ...group, ackToken: signReceipt({ consumerId, eventIds: [...new Set(eventIds)], expiresAt: Date.now() + RECEIPT_TTL_MS }, secret) } : group;
+  }) };
+}
+function signReceipt(receipt: Receipt, secret: string): string {
+  const payload = Buffer.from(JSON.stringify(receipt)).toString("base64url");
+  return `${payload}.${createHmac("sha256", secret).update(payload).digest("base64url")}`;
+}
+function readReceipt(token: string, secret: string): Receipt {
+  const [payload, signature, extra] = token.split(".");
+  if (!payload || !signature || extra) throw new Error("Invalid acknowledgement receipt");
+  const expected = createHmac("sha256", secret).update(payload).digest("base64url");
+  if (signature.length !== expected.length || !timingSafeEqual(Buffer.from(signature), Buffer.from(expected))) throw new Error("Invalid acknowledgement receipt");
+  let receipt: unknown;
+  try { receipt = JSON.parse(Buffer.from(payload, "base64url").toString("utf8")); } catch { throw new Error("Invalid acknowledgement receipt"); }
+  if (!receipt || typeof receipt !== "object") throw new Error("Invalid acknowledgement receipt");
+  const item = receipt as Partial<Receipt>;
+  if (typeof item.consumerId !== "string" || !Array.isArray(item.eventIds) || !item.eventIds.every((id) => typeof id === "string") || typeof item.expiresAt !== "number" || item.expiresAt < Date.now()) throw new Error("Acknowledgement receipt expired or invalid");
+  return { consumerId: item.consumerId, eventIds: item.eventIds, expiresAt: item.expiresAt };
 }
 
 type McpTransportFactory = typeof createMcpTransport;

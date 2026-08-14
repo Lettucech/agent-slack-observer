@@ -2,7 +2,7 @@ import express, { type NextFunction, type Request, type Response } from "express
 import { SlackBackfillWorker } from "./backfill.js";
 import { loadConfig } from "./config.js";
 import { Database } from "./db.js";
-import { createMcpRequestHandler } from "./mcp.js";
+import { createMcpRequestHandler, createMcpTransport } from "./mcp.js";
 import { SlackMetadataSync } from "./slack-metadata.js";
 import { SocketModeObserver } from "./socket-mode.js";
 
@@ -41,7 +41,7 @@ function requireBearer(expected: string) {
 }
 
 app.use(express.json({ limit: "1mb" }));
-const handleMcpRequest = createMcpRequestHandler(database, config.threadSettleSeconds);
+const handleMcpRequest = createMcpRequestHandler(database, config.threadSettleSeconds, (db, settleSeconds) => createMcpTransport(db, settleSeconds, config.mcpAuthToken));
 app.post("/mcp", requireBearer(config.mcpAuthToken), handleMcpRequest);
 app.get("/mcp", requireBearer(config.mcpAuthToken), handleMcpRequest);
 
