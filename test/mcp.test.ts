@@ -80,3 +80,34 @@ test("uses a consumer inbox without requiring an agent cursor and acknowledges o
     await server.close();
   }
 });
+
+test("continues an oversized message without dropping text", async () => {
+  const oversized: StoredMessage = { eventId: "Ev-large", eventSequence: 1, workspaceId: "T1", channelId: "C1", messageTs: "1000.0", threadTs: null, userId: "U1", subtype: null, text: "x".repeat(500), payload: { blocks: "ignored" }, observedAt: "2026-08-13T00:00:00Z" };
+  const database = { getMessage: async () => oversized } as unknown as Database;
+  const { server } = createMcpTransport(database, 90);
+  const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+  const client = new Client({ name: "test-client", version: "1.0.0" });
+  await server.connect(serverTransport);
+  await client.connect(clientTransport);
+  try {
+    let offset = 0;
+    let reconstructed = "";
+    let finalAckToken: string | undefined;
+    for (let index = 0; index < 20; index += 1) {
+      const result = await client.callTool({ name: "get_message_digest", arguments: { consumerId: "hermes", workspaceId: "T1", channelId: "C1", messageTs: "1000.0", afterTextOffset: offset, maxTokens: 128 } });
+      const segment = result.structuredContent as { message: { text: string; textContinues?: number }; ackToken?: string };
+      reconstructed += segment.message.text;
+      if (segment.message.textContinues === undefined) {
+        finalAckToken = segment.ackToken;
+        break;
+      }
+      assert.equal(segment.ackToken, undefined);
+      offset = segment.message.textContinues;
+    }
+    assert.equal(reconstructed, oversized.text);
+    assert.equal(typeof finalAckToken, "string");
+  } finally {
+    await client.close();
+    await server.close();
+  }
+});

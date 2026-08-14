@@ -12,7 +12,7 @@ Use the observer as a Slack read-only inbox. It monitors channels chosen by its 
 - Ensure the observer MCP server is configured outside this skill, including its bearer token. Never request, print, or persist that token in a summary.
 - Pick and keep a stable `consumerId` for this scheduled digesting agent (for example, `hermes-vault-digest`). The observer tracks successful acknowledgements separately for each consumer, so another agent cannot clear this inbox.
 - Keep an unfinished thread continuation (`workspaceId`, `channelId`, `threadTs`, `afterMessageTs`) only while processing. A consumer inbox does not need a persisted `upperSequence`, handled-event IDs, or acknowledgement state.
-- Set `maxTokens` to the input context remaining after reserving system, tool, and answer tokens. Prefer a conservative budget; message token estimates are approximate.
+- Set `maxTokens` to the input context remaining after reserving system, tool, and answer tokens. Digest results exclude raw Slack payloads and use a conservative projected-JSON budget. A `textContinues` value is a Unicode code-point offset, not data loss.
 
 ## Digest workflow
 
@@ -23,9 +23,10 @@ Use the observer as a Slack read-only inbox. It monitors channels chosen by its 
    - For a `thread`, read the root and replies together, even if the replies arrived between unrelated channel messages.
    - For a `channel_window`, treat the nearby messages as one local discussion, but do not invent a thread relationship.
    - Use `workspaceName` and `channelName` as helpful labels only; IDs are the stable references.
-4. Extract only material information: decisions, owners, deadlines, blockers, open questions, and changes that affect the requesting task. Attribute claims to the speaker or message when ambiguity matters. Do not expose raw payloads unless the user needs forensic detail.
-5. If `threadContinues` is true, call `get_thread_digest` for that exact thread with the same `consumerId`. Pass the last returned non-root `messageTs` as `afterMessageTs`; keep the repeated root as context. Continue until the thread no longer continues before treating that thread as digested.
-6. After saving a complete group, call `ack_digest` with exactly its `ackToken`. Do not acknowledge a partial or failed group. A final thread chunk's token covers the complete settled thread snapshot.
+4. If any message has `textContinues`, call `get_message_digest` with the same `consumerId`, its workspace/channel/message IDs, the returned offset, and the same budget. Repeat until it has no `textContinues`; concatenate the segments in order. Its final segment has an `ackToken` for that completed event only. If it was a thread root, call `get_thread_digest` with `includeRoot: false` before reading replies, so the root does not restart from its first segment.
+5. Extract only material information: decisions, owners, deadlines, blockers, open questions, and changes that affect the requesting task. Attribute claims to the speaker or message when ambiguity matters. Raw Slack payloads are not available through digest tools.
+6. If `threadContinues` is true, call `get_thread_digest` for that exact thread with the same `consumerId`. Pass the last returned non-root `messageTs` as `afterMessageTs`; keep the repeated root as context unless it was already fully read through `get_message_digest`, in which case use `includeRoot: false`. Continue until the thread no longer continues before treating that thread as digested.
+7. After saving a complete group, call `ack_digest` with exactly its `ackToken`. Do not acknowledge a partial or failed group. A final thread chunk's token covers the complete settled thread snapshot.
 
 ## Acknowledgement safety
 

@@ -3,8 +3,8 @@ import test from "node:test";
 import { makeDigestBatch } from "../src/digest.js";
 import type { StoredMessage } from "../src/types.js";
 
-function message(sequence: number, ts: string, text: string, threadTs: string | null = null): StoredMessage {
-  return { eventId: `Ev${sequence}`, eventSequence: sequence, workspaceId: "T1", channelId: "C1", messageTs: ts, threadTs, userId: "U1", subtype: null, text, payload: {}, observedAt: "2026-08-11T00:00:00Z" };
+function message(sequence: number, ts: string, text: string, threadTs: string | null = null, payload: Record<string, unknown> = {}): StoredMessage {
+  return { eventId: `Ev${sequence}`, eventSequence: sequence, workspaceId: "T1", channelId: "C1", messageTs: ts, threadTs, userId: "U1", subtype: null, text, payload, observedAt: "2026-08-11T00:00:00Z" };
 }
 
 test("keeps a thread together even when unrelated messages arrive between replies", () => {
@@ -24,6 +24,27 @@ test("splits an oversized thread with its root message retained", () => {
   assert.equal(batch.groups[0].kind, "thread");
   assert.equal(batch.groups[0].messages[0].eventId, "Ev1");
   assert.equal(batch.groups[0].threadContinues, true);
+});
+
+test("omits raw Slack payloads from digest output", () => {
+  const batch = makeDigestBatch([
+    message(1, "1000.000001", "Short digest text", null, { blocks: "x".repeat(137_000) }),
+  ], { maxTokens: 128 }, 1);
+
+  assert.equal("payload" in batch.groups[0].messages[0], false);
+  assert.ok(batch.estimatedTokens <= 128);
+  assert.ok(Buffer.byteLength(JSON.stringify(batch), "utf8") < 128 * 4);
+});
+
+test("returns a continuation for a single oversized root without losing text", () => {
+  const batch = makeDigestBatch([
+    message(1, "1000.000001", "x".repeat(10_000)),
+  ], { maxTokens: 128 }, 1);
+
+  assert.ok(batch.estimatedTokens <= 128);
+  assert.equal(typeof batch.groups[0].messages[0].textContinues, "number");
+  assert.ok(batch.groups[0].messages[0].text.length < 10_000);
+  assert.ok(Buffer.byteLength(JSON.stringify(batch), "utf8") < 128 * 4);
 });
 
 test("orders reverse-paginated backfill by Slack timestamp rather than insertion sequence", () => {

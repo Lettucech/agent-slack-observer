@@ -335,6 +335,10 @@ export class Database {
     const messages = result.rows.map(toStoredMessage); if (!afterMessageTs) return messages;
     const root = messages.find((item) => item.messageTs === threadTs); return [...(root ? [root] : []), ...messages.filter((item) => item.messageTs > afterMessageTs && item.messageTs !== threadTs)];
   }
+  async getMessage(workspaceId: string, channelId: string, messageTs: string): Promise<StoredMessage | undefined> {
+    const result = await this.pool.query<MessageRow>(`${messageSelect} WHERE m.workspace_id = $1 AND m.channel_id = $2 AND m.message_ts = $3`, [workspaceId, channelId, messageTs]);
+    return result.rows[0] ? toStoredMessage(result.rows[0]) : undefined;
+  }
 
   async listChannels(): Promise<Array<{ workspaceId: string; workspaceName: string | null; channelId: string; channelName: string | null; enabled: boolean; messageCount: number; lastObservedAt: string | null }>> {
     const result = await this.pool.query<ChannelRow>(

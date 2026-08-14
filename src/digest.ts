@@ -1,24 +1,60 @@
-import type { DigestBatch, DigestGroup, StoredMessage } from "./types.js";
+import type { DigestBatch, DigestGroup, DigestMessage, StoredMessage } from "./types.js";
 
 type DigestOptions = {
   maxTokens: number;
   channelWindowSeconds?: number;
 };
 
-function estimateTokens(message: StoredMessage): number {
-  // Deliberately conservative and tokenizer-independent: Japanese/Chinese and JSON metadata
-  // can consume more tokens than English prose. The exact total is returned as an estimate.
-  const text = message.text ?? "";
-  const payloadOverhead = JSON.stringify(message.payload).length;
-  return Math.max(24, Math.ceil((text.length * 1.25 + Math.min(payloadOverhead, 1200)) / 3));
+type GroupedMessages = {
+  kind: DigestGroup["kind"];
+  messages: StoredMessage[];
+  threadTs?: string;
+};
+
+function estimateTokens(message: DigestMessage): number {
+  // Count the exact projected JSON bytes instead of capping an unreturned approximation.
+  // This intentionally overestimates ordinary text tokens, keeping budgets safe for CJK and JSON.
+  return Math.max(24, Buffer.byteLength(JSON.stringify(message), "utf8"));
+}
+
+function projectMessage(message: StoredMessage, text = message.text, textContinues?: number): DigestMessage {
+  return {
+    eventId: message.eventId,
+    messageTs: message.messageTs,
+    userId: message.userId,
+    subtype: message.subtype,
+    text,
+    ...(textContinues === undefined ? {} : { textContinues }),
+  };
+}
+
+/** Return the next lossless text segment that fits the caller's budget. */
+export function makeMessageDigestSegment(message: StoredMessage, maxTokens: number, afterTextOffset = 0): DigestMessage {
+  if (!Number.isInteger(maxTokens) || maxTokens < 128) throw new Error("maxTokens must be at least 128");
+  if (!Number.isInteger(afterTextOffset) || afterTextOffset < 0) throw new Error("afterTextOffset must be a non-negative integer");
+  const characters = Array.from(message.text ?? "");
+  if (afterTextOffset > characters.length) throw new Error("afterTextOffset is beyond the message text");
+
+  const full = projectMessage(message, characters.slice(afterTextOffset).join(""));
+  if (estimateTokens(full) <= maxTokens || !message.text) return full;
+
+  let low = afterTextOffset;
+  let high = characters.length;
+  while (low < high) {
+    const middle = Math.ceil((low + high) / 2);
+    const candidate = projectMessage(message, characters.slice(afterTextOffset, middle).join(""), middle);
+    if (estimateTokens(candidate) <= maxTokens) low = middle;
+    else high = middle - 1;
+  }
+  return projectMessage(message, characters.slice(afterTextOffset, low).join(""), low);
 }
 
 function messageTime(message: StoredMessage): number {
   return Number(message.messageTs.split(".")[0]) || 0;
 }
 
-function makeGroup(kind: DigestGroup["kind"], messages: StoredMessage[], threadTs?: string): DigestGroup {
-  const first = messages[0];
+function makeGroup(kind: DigestGroup["kind"], sourceMessages: StoredMessage[], threadTs?: string, digestMessages = sourceMessages.map((message) => projectMessage(message))): DigestGroup {
+  const first = sourceMessages[0];
   return {
     id: threadTs ? `${first.workspaceId}:${first.channelId}:${threadTs}` : `${first.workspaceId}:${first.channelId}:${first.eventSequence}`,
     kind,
@@ -26,8 +62,8 @@ function makeGroup(kind: DigestGroup["kind"], messages: StoredMessage[], threadT
     workspaceName: first.workspaceName,
     channelId: first.channelId,
     channelName: first.channelName,
-    messages,
-    estimatedTokens: messages.reduce((sum, message) => sum + estimateTokens(message), 0),
+    messages: digestMessages,
+    estimatedTokens: digestMessages.reduce((sum, message) => sum + estimateTokens(message), 0),
     ...(threadTs ? { threadTs } : {}),
     threadContinues: false,
   };
@@ -37,7 +73,7 @@ function makeGroup(kind: DigestGroup["kind"], messages: StoredMessage[], threadT
  * Build groups before applying the model budget. Thread members are grouped by their
  * root timestamp, so unrelated live messages cannot split a discussion.
  */
-export function groupMessages(messages: StoredMessage[], channelWindowSeconds = 300): DigestGroup[] {
+function groupMessages(messages: StoredMessage[], channelWindowSeconds = 300): GroupedMessages[] {
   const threads = new Map<string, StoredMessage[]>();
   const standaloneByChannel = new Map<string, StoredMessage[]>();
   const rootKeys = new Set(messages.filter((message) => message.threadTs).map((message) => `${message.workspaceId}:${message.channelId}:${message.threadTs}`));
@@ -57,11 +93,11 @@ export function groupMessages(messages: StoredMessage[], channelWindowSeconds = 
     }
   }
 
-  const groups: DigestGroup[] = [];
+  const groups: GroupedMessages[] = [];
   for (const threadMessages of threads.values()) {
     const root = threadMessages.find((message) => message.messageTs === (message.threadTs ?? message.messageTs));
     const ordered = root ? [root, ...threadMessages.filter((message) => message !== root)] : threadMessages;
-    groups.push(makeGroup("thread", ordered, ordered[0].threadTs ?? ordered[0].messageTs));
+    groups.push({ kind: "thread", messages: ordered, threadTs: ordered[0].threadTs ?? ordered[0].messageTs });
   }
 
   for (const channelMessages of standaloneByChannel.values()) {
@@ -69,12 +105,12 @@ export function groupMessages(messages: StoredMessage[], channelWindowSeconds = 
     for (const message of channelMessages) {
       const previous = window.at(-1);
       if (previous && messageTime(message) - messageTime(previous) > channelWindowSeconds) {
-        groups.push(makeGroup("channel_window", window));
+        groups.push({ kind: "channel_window", messages: window });
         window = [];
       }
       window.push(message);
     }
-    if (window.length) groups.push(makeGroup("channel_window", window));
+    if (window.length) groups.push({ kind: "channel_window", messages: window });
   }
 
   return groups.sort((a, b) => messageTime(a.messages[0]) - messageTime(b.messages[0]));
@@ -89,7 +125,8 @@ export function makeDigestBatch(messages: StoredMessage[], options: DigestOption
   let used = 0;
 
   for (let index = 0; index < groups.length; index += 1) {
-    const group = groups[index];
+    const sourceGroup = groups[index];
+    const group = makeGroup(sourceGroup.kind, sourceGroup.messages, sourceGroup.threadTs);
     if (used + group.estimatedTokens <= options.maxTokens) {
       selected.push(group);
       used += group.estimatedTokens;
@@ -98,17 +135,20 @@ export function makeDigestBatch(messages: StoredMessage[], options: DigestOption
     if (selected.length > 0) return { groups: selected, estimatedTokens: used, hasMore: true, upperSequence };
 
     // A single thread/window exceeds the caller's budget. Return the largest anchored prefix.
-    const root = group.kind === "thread" ? group.messages[0] : undefined;
-    const chunk: StoredMessage[] = root ? [root] : [];
-    let chunkTokens = root ? estimateTokens(root) : 0;
-    for (const message of group.messages.slice(root ? 1 : 0)) {
-      const cost = estimateTokens(message);
+    const chunk: StoredMessage[] = [];
+    const digestChunk: DigestMessage[] = [];
+    let chunkTokens = 0;
+    for (const message of sourceGroup.messages) {
+      const remaining = options.maxTokens - chunkTokens;
+      const projected = chunk.length === 0 ? makeMessageDigestSegment(message, remaining) : projectMessage(message);
+      const cost = estimateTokens(projected);
       if (chunk.length > 0 && chunkTokens + cost > options.maxTokens) break;
       chunk.push(message);
+      digestChunk.push(projected);
       chunkTokens += cost;
     }
-    const partial = makeGroup(group.kind, chunk, group.threadTs);
-    partial.threadContinues = chunk.length < group.messages.length;
+    const partial = makeGroup(sourceGroup.kind, chunk, sourceGroup.threadTs, digestChunk);
+    partial.threadContinues = chunk.length < sourceGroup.messages.length;
     return { groups: [partial], estimatedTokens: partial.estimatedTokens, hasMore: true, upperSequence };
   }
   return { groups: selected, estimatedTokens: used, hasMore: false, upperSequence };

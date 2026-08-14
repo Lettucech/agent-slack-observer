@@ -4,7 +4,7 @@ import type { NextFunction, Request, Response } from "express";
 import { createHmac, timingSafeEqual } from "node:crypto";
 import { z } from "zod";
 import type { Database } from "./db.js";
-import { makeDigestBatch } from "./digest.js";
+import { makeDigestBatch, makeMessageDigestSegment } from "./digest.js";
 
 export function createMcpTransport(database: Database, defaultSettleSeconds: number, receiptSecret = "test-only-receipt-secret") {
   const server = new McpServer(
@@ -35,6 +35,31 @@ export function createMcpTransport(database: Database, defaultSettleSeconds: num
         content: [{ type: "text", text: JSON.stringify(delivered) }],
         structuredContent: delivered,
       };
+    },
+  );
+
+  server.registerTool(
+    "get_message_digest",
+    {
+      title: "Continue one oversized Slack message",
+      description: "Read the next lossless text segment after get_digest_batches returns textContinues. Only a final segment has an ackToken for that one event.",
+      inputSchema: {
+        consumerId: z.string().min(1).max(200),
+        workspaceId: z.string().min(1),
+        channelId: z.string().min(1),
+        messageTs: z.string().min(1),
+        afterTextOffset: z.number().int().min(0).describe("Unicode code-point offset from textContinues."),
+        maxTokens: z.number().int().min(128).max(100000),
+      },
+    },
+    async ({ consumerId, workspaceId, channelId, messageTs, afterTextOffset, maxTokens }) => {
+      const message = await database.getMessage(workspaceId, channelId, messageTs);
+      if (!message) throw new Error("Message is no longer retained by this observer");
+      const segment = makeMessageDigestSegment(message, maxTokens, afterTextOffset);
+      const delivered = segment.textContinues === undefined
+        ? { message: segment, ackToken: signReceipt({ consumerId, eventIds: [message.eventId], expiresAt: Date.now() + RECEIPT_TTL_MS }, receiptSecret) }
+        : { message: segment };
+      return { content: [{ type: "text", text: JSON.stringify(delivered) }], structuredContent: delivered };
     },
   );
 
@@ -78,13 +103,15 @@ export function createMcpTransport(database: Database, defaultSettleSeconds: num
         channelId: z.string().min(1),
         threadTs: z.string().min(1),
         afterMessageTs: z.string().optional().describe("Last non-root message_ts the agent received for this thread."),
+        includeRoot: z.boolean().optional().describe("Set false after separately finishing an oversized root text; default true retains root context."),
         maxTokens: z.number().int().min(128).max(100000),
         settleSeconds: z.number().int().min(0).max(3600).optional(),
       },
     },
-    async ({ consumerId, workspaceId, channelId, threadTs, afterMessageTs, maxTokens, settleSeconds }) => {
+    async ({ consumerId, workspaceId, channelId, threadTs, afterMessageTs, includeRoot, maxTokens, settleSeconds }) => {
       const messages = await database.getThread(workspaceId, channelId, threadTs, afterMessageTs, settleSeconds ?? defaultSettleSeconds);
-      const batch = makeDigestBatch(messages, { maxTokens }, await database.latestSequence());
+      const digestMessages = includeRoot === false ? messages.filter((message) => message.messageTs !== threadTs) : messages;
+      const batch = makeDigestBatch(digestMessages, { maxTokens }, await database.latestSequence());
       const allMessages = await database.getThread(workspaceId, channelId, threadTs, undefined, settleSeconds ?? defaultSettleSeconds);
       const delivered = addAckTokens(batch, consumerId, new Set(allMessages.map((message) => message.eventId)), receiptSecret);
       return { content: [{ type: "text", text: JSON.stringify(delivered) }], structuredContent: delivered };
@@ -112,7 +139,7 @@ const RECEIPT_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 type Receipt = { consumerId: string; eventIds: string[]; expiresAt: number };
 function addAckTokens(batch: ReturnType<typeof makeDigestBatch>, consumerId: string, eligibleEventIds: Set<string>, secret: string) {
   return { ...batch, groups: batch.groups.map((group) => {
-    if (group.threadContinues) return group;
+    if (group.threadContinues || group.messages.some((message) => message.textContinues !== undefined)) return group;
     const eventIds = group.messages.map((message) => message.eventId).filter((eventId) => eligibleEventIds.has(eventId));
     return eventIds.length ? { ...group, ackToken: signReceipt({ consumerId, eventIds: [...new Set(eventIds)], expiresAt: Date.now() + RECEIPT_TTL_MS }, secret) } : group;
   }) };
