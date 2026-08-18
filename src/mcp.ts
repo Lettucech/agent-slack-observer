@@ -6,6 +6,14 @@ import { z } from "zod";
 import type { Database } from "./db.js";
 import { makeDigestBatch, makeMessageDigestSegment } from "./digest.js";
 
+// Slack timestamps are identifiers, so consumers should send text. A few MCP
+// runtimes coerce numeric-looking tool arguments before they reach the server;
+// accepting finite numbers here keeps those clients lossless for normal Slack
+// timestamp values while all database lookups still use their canonical text form.
+const slackTimestamp = z.union([z.string(), z.number().finite()])
+  .transform((value) => String(value))
+  .pipe(z.string().min(1));
+
 export function createMcpTransport(database: Database, defaultSettleSeconds: number, receiptSecret = "test-only-receipt-secret") {
   const server = new McpServer(
     { name: "agent-slack-observer", version: "0.1.0" },
@@ -47,7 +55,7 @@ export function createMcpTransport(database: Database, defaultSettleSeconds: num
         consumerId: z.string().min(1).max(200),
         workspaceId: z.string().min(1),
         channelId: z.string().min(1),
-        messageTs: z.string().min(1),
+        messageTs: slackTimestamp,
         afterTextOffset: z.number().int().min(0).describe("Unicode code-point offset from textContinues."),
         maxTokens: z.number().int().min(128).max(100000),
       },
@@ -101,8 +109,8 @@ export function createMcpTransport(database: Database, defaultSettleSeconds: num
         consumerId: z.string().min(1).max(200),
         workspaceId: z.string().min(1),
         channelId: z.string().min(1),
-        threadTs: z.string().min(1),
-        afterMessageTs: z.string().optional().describe("Last non-root message_ts the agent received for this thread."),
+        threadTs: slackTimestamp,
+        afterMessageTs: slackTimestamp.optional().describe("Last non-root message_ts the agent received for this thread."),
         includeRoot: z.boolean().optional().describe("Set false after separately finishing an oversized root text; default true retains root context."),
         maxTokens: z.number().int().min(128).max(100000),
         settleSeconds: z.number().int().min(0).max(3600).optional(),

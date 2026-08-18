@@ -111,3 +111,37 @@ test("continues an oversized message without dropping text", async () => {
     await server.close();
   }
 });
+
+test("normalizes numeric Slack timestamps coerced by an MCP client", async () => {
+  const message: StoredMessage = { eventId: "Ev-ts", eventSequence: 1, workspaceId: "T1", channelId: "C1", messageTs: "1786501755.941399", threadTs: null, userId: "U1", subtype: null, text: "one", payload: {}, observedAt: "2026-08-13T00:00:00Z" };
+  const messageLookups: string[] = [];
+  const threadLookups: Array<{ threadTs: string; afterMessageTs: string | undefined }> = [];
+  const database = {
+    getMessage: async (_workspaceId: string, _channelId: string, messageTs: string) => {
+      messageLookups.push(messageTs);
+      return message;
+    },
+    getThread: async (_workspaceId: string, _channelId: string, threadTs: string, afterMessageTs: string | undefined) => {
+      threadLookups.push({ threadTs, afterMessageTs });
+      return [message];
+    },
+    latestSequence: async () => 1,
+  } as unknown as Database;
+  const { server } = createMcpTransport(database, 90);
+  const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+  const client = new Client({ name: "test-client", version: "1.0.0" });
+  await server.connect(serverTransport);
+  await client.connect(clientTransport);
+  try {
+    await client.callTool({ name: "get_message_digest", arguments: { consumerId: "hermes", workspaceId: "T1", channelId: "C1", messageTs: 1786501755.941399, afterTextOffset: 0, maxTokens: 128 } });
+    await client.callTool({ name: "get_thread_digest", arguments: { consumerId: "hermes", workspaceId: "T1", channelId: "C1", threadTs: 1786501755.941399, afterMessageTs: 1786501755.941399, maxTokens: 128 } });
+    assert.deepEqual(messageLookups, ["1786501755.941399"]);
+    assert.deepEqual(threadLookups, [
+      { threadTs: "1786501755.941399", afterMessageTs: "1786501755.941399" },
+      { threadTs: "1786501755.941399", afterMessageTs: undefined },
+    ]);
+  } finally {
+    await client.close();
+    await server.close();
+  }
+});
