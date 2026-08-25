@@ -5,6 +5,7 @@ export type SlackEnvelope = { event_id?: unknown; team_id?: unknown; api_app_id?
 export type SlackHistoryMessage = Record<string, unknown> & { ts: string; type?: string; thread_ts?: string; reply_count?: number; latest_reply?: string };
 export type BackfillTask = { id: number; jobId: number; workspaceId: string; channelId: string; phase: "history" | "replies"; cursor: string | null; rootTs: string | null; oldest: string; latest: string; attempts: number };
 export type BackfillJob = { id: number; kind: "initial" | "manual" | "downtime"; state: string; requestedStartAt: string; requestedEndAt: string; createdAt: string; completedAt: string | null; channels: number; completedTasks: number; totalTasks: number; historyTasks: number; replyTasks: number; lastError: string | null };
+export type ConsumerProgress = { consumerId: string; totalMessages: number; acknowledgedMessages: number; pendingMessages: number; lastAcknowledgedAt: string | null };
 
 export class Database {
   readonly pool: Pool;
@@ -368,13 +369,20 @@ export class Database {
       FROM backfill_jobs j LEFT JOIN backfill_tasks t ON t.job_id = j.id GROUP BY j.id ORDER BY j.id DESC LIMIT 20`);
     return result.rows.map(toJob);
   }
-  async dashboardStatus(): Promise<{ events: number; messages: number; lastReceivedAt: string | null; channels: number; earliestMessageAt: string | null; nextBackfillRequestAt: string | null }> {
+  async dashboardStatus(): Promise<{ events: number; messages: number; lastReceivedAt: string | null; channels: number; earliestMessageAt: string | null; nextBackfillRequestAt: string | null; consumers: ConsumerProgress[] }> {
     const result = await this.pool.query<{ events: string; messages: string; last_received_at: string | null; channels: string; earliest_message_at: string | null; next_request_at: string | null }>(
       `SELECT (SELECT count(*) FROM slack_events)::text AS events, (SELECT count(*) FROM messages)::text AS messages,
        (SELECT max(received_at)::text FROM slack_events) AS last_received_at, (SELECT count(*) FROM observation_targets WHERE enabled)::text AS channels,
        (SELECT min(to_timestamp(message_ts::double precision))::text FROM messages) AS earliest_message_at,
        (SELECT next_request_at::text FROM backfill_runtime WHERE singleton) AS next_request_at`);
-    const row = result.rows[0]; return { events: Number(row.events), messages: Number(row.messages), lastReceivedAt: row.last_received_at, channels: Number(row.channels), earliestMessageAt: row.earliest_message_at, nextBackfillRequestAt: row.next_request_at };
+    const consumers = await this.pool.query<{ consumer_id: string; total_messages: string; acknowledged_messages: string; pending_messages: string; last_acknowledged_at: string | null }>(
+      `WITH consumers AS (SELECT DISTINCT consumer_id FROM consumer_message_acks)
+       SELECT c.consumer_id, count(m.event_id)::text AS total_messages, count(a.event_id)::text AS acknowledged_messages,
+         (count(m.event_id) - count(a.event_id))::text AS pending_messages, max(a.acknowledged_at)::text AS last_acknowledged_at
+       FROM consumers c CROSS JOIN messages m
+       LEFT JOIN consumer_message_acks a ON a.consumer_id = c.consumer_id AND a.event_id = m.event_id
+       GROUP BY c.consumer_id ORDER BY max(a.acknowledged_at) DESC NULLS LAST, c.consumer_id`);
+    const row = result.rows[0]; return { events: Number(row.events), messages: Number(row.messages), lastReceivedAt: row.last_received_at, channels: Number(row.channels), earliestMessageAt: row.earliest_message_at, nextBackfillRequestAt: row.next_request_at, consumers: consumers.rows.map(toConsumerProgress) };
   }
   async close(): Promise<void> { await this.pool.end(); }
 
@@ -394,6 +402,7 @@ type TaskRow = { id: string; job_id: string; workspace_id: string; channel_id: s
 type ChannelRow = { workspace_id: string; workspace_name: string | null; channel_id: string; channel_name: string | null; enabled: boolean; message_count: string; last_observed_at: string | null };
 type JobRow = { id: string; kind: "initial" | "manual" | "downtime"; state: string; requested_start_at: string; requested_end_at: string; created_at: string; completed_at: string | null; last_error: string | null; channels: string; completed_tasks: string; total_tasks: string; history_tasks: string; reply_tasks: string };
 function toStoredMessage(row: MessageRow): StoredMessage { return { eventId: row.event_id, eventSequence: Number(row.event_sequence), workspaceId: row.workspace_id, channelId: row.channel_id, messageTs: row.message_ts, threadTs: row.thread_ts, userId: row.user_id, subtype: row.subtype, text: row.text, payload: row.event_payload, observedAt: row.observed_at, workspaceName: row.workspace_name, channelName: row.channel_name }; }
+export function toConsumerProgress(row: { consumer_id: string; total_messages: string; acknowledged_messages: string; pending_messages: string; last_acknowledged_at: string | null }): ConsumerProgress { return { consumerId: row.consumer_id, totalMessages: Number(row.total_messages), acknowledgedMessages: Number(row.acknowledged_messages), pendingMessages: Number(row.pending_messages), lastAcknowledgedAt: row.last_acknowledged_at }; }
 function toTask(row: TaskRow): BackfillTask { return { id: Number(row.id), jobId: Number(row.job_id), workspaceId: row.workspace_id, channelId: row.channel_id, phase: row.phase, cursor: row.cursor, rootTs: row.root_ts, oldest: row.oldest, latest: row.latest, attempts: row.attempts }; }
 function toJob(row: JobRow): BackfillJob { return { id: Number(row.id), kind: row.kind, state: row.state, requestedStartAt: row.requested_start_at, requestedEndAt: row.requested_end_at, createdAt: row.created_at, completedAt: row.completed_at, channels: Number(row.channels), completedTasks: Number(row.completed_tasks), totalTasks: Number(row.total_tasks), historyTasks: Number(row.history_tasks), replyTasks: Number(row.reply_tasks), lastError: row.last_error }; }
 function historyEventId(workspaceId: string, channelId: string, ts: string): string { return `history:${workspaceId}:${channelId}:${ts}`; }
