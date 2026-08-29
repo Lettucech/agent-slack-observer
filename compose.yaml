@@ -1,18 +1,8 @@
 services:
   observer:
     build: .
-    environment:
-      SLACK_APP_TOKEN: ${SLACK_APP_TOKEN:?set SLACK_APP_TOKEN in .env}
-      SLACK_BOT_TOKEN: ${SLACK_BOT_TOKEN:?set SLACK_BOT_TOKEN in .env}
-      MCP_AUTH_TOKEN: ${MCP_AUTH_TOKEN:?set MCP_AUTH_TOKEN in .env}
-      DATABASE_URL: postgres://observer:observer@db:5432/observer
-      THREAD_SETTLE_SECONDS: ${THREAD_SETTLE_SECONDS:-90}
-      MESSAGE_RETENTION_DAYS: ${MESSAGE_RETENTION_DAYS:-30}
-      RAW_EVENT_RETENTION_DAYS: ${RAW_EVENT_RETENTION_DAYS:-7}
-      BACKFILL_REQUEST_INTERVAL_SECONDS: ${BACKFILL_REQUEST_INTERVAL_SECONDS:-60}
-      DOWNTIME_SUGGESTION_SECONDS: ${DOWNTIME_SUGGESTION_SECONDS:-300}
     ports:
-      - "127.0.0.1:${PORT:-3000}:3000"
+      - "127.0.0.1:3000:3000"
     depends_on:
       db:
         condition: service_healthy

@@ -31,7 +31,7 @@ export class SlackBackfillWorker {
   private stopped = true;
   private running = false;
 
-  constructor(private readonly botToken: string, private readonly database: BackfillDatabase, private readonly options: BackfillWorkerOptions) {}
+  constructor(private readonly readToken: string, private readonly database: BackfillDatabase, private readonly options: BackfillWorkerOptions) {}
 
   start(): void {
     if (!this.stopped) return;
@@ -108,7 +108,7 @@ export class SlackBackfillWorker {
       parameters.set("ts", task.rootTs);
     }
     const method = task.phase === "history" ? "conversations.history" : "conversations.replies";
-    const response = await fetch(`https://slack.com/api/${method}?${parameters}`, { headers: { Authorization: `Bearer ${this.botToken}` } });
+    const response = await fetch(`https://slack.com/api/${method}?${parameters}`, { headers: { Authorization: `Bearer ${this.readToken}` } });
     if (response.status === 429) {
       const parsed = Number(response.headers.get("retry-after"));
       throw new RateLimitError(Number.isFinite(parsed) && parsed >= 0 ? parsed * 1000 : FALLBACK_RETRY_MS);

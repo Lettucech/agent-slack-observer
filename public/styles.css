@@ -17,6 +17,16 @@ p { margin: 0; color: #65728a; line-height: 1.55; }
 .eyebrow { display: flex; align-items: center; gap: 8px; margin: 0; color: #287b72; font-size: .72rem; font-weight: 800; letter-spacing: .135em; }
 .eyebrow::before { width: 9px; height: 9px; border-radius: 50%; background: linear-gradient(135deg, #21c79a, #3485ef); box-shadow: 0 0 0 5px #d9f7ee; content: ""; }
 .card { margin: 20px 0; padding: 28px; border: 1px solid #e0e7f1; border-radius: 16px; background: #fff; box-shadow: 0 1px 2px #25355308; }
+.settings-card { border-color: #cce3dc; background: linear-gradient(135deg, #ffffff, #f5fcfa); }
+.status-pill { padding: 6px 9px; border-radius: 999px; color: #287b72; background: #e6f8f2; font-size: .75rem; font-weight: 750; white-space: nowrap; }
+.status-pill.incomplete { color: #89591d; background: #fff2dc; }
+.settings-form { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 14px; align-items: end; }
+.settings-form label { display: grid; gap: 7px; color: #43516a; font-size: .8rem; font-weight: 700; }
+.settings-form label small { color: #8290a5; font-weight: 500; }
+.settings-actions { display: flex; flex-wrap: wrap; gap: 8px; grid-column: 1 / -1; }
+.settings-rotate { margin-top: 14px; }
+.token-result { display: grid; gap: 8px; margin-top: 16px; padding: 14px; border: 1px solid #f0c878; border-radius: 10px; background: #fff9e9; }
+.token-result code { display: block; width: fit-content; max-width: 100%; padding: 8px; user-select: all; }
 form { display: flex; gap: 10px; margin-top: 14px; }
 input { flex: 1; min-width: 0; padding: 12px 14px; border: 1px solid #cfd9e8; border-radius: 9px; outline: none; color: #17233a; background: #f8fafd; font: inherit; transition: border-color .16s, box-shadow .16s, background .16s; }
 input:focus { border-color: #3685e8; background: #fff; box-shadow: 0 0 0 3px #3685e81c; }
@@ -41,6 +51,8 @@ button.tiny { padding: 6px 9px; margin: 4px 4px 0 0; font-size: .72rem; }
 .table-wrap { overflow: auto; margin: 2px -8px -6px; }
 .backfill-controls { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 24px; padding: 22px 0; border-bottom: 1px solid #edf1f6; }
 .backfill-targets, .backfill-window { min-width: 0; }
+.manual-target-heading { margin-top: 24px; }
+#discovery-status { min-height: 22px; margin-top: 10px; }
 .backfill-targets form, .backfill-window form { max-width: none; }
 .backfill-card > #backfill-status { margin-top: 18px; }
 .backfill-jobs-wrap { width: auto; min-height: 82px; margin-top: 14px; }
@@ -68,6 +80,7 @@ small { color: #8290a5; }
   .section-heading { align-items: flex-start; flex-direction: column; }
   .button-group { width: 100%; justify-content: flex-start; }
   form { flex-direction: column; }
+  .settings-form { grid-template-columns: 1fr; }
   .backfill-controls { grid-template-columns: 1fr; gap: 20px; }
   .stats { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .stat { min-height: 106px; padding: 16px; }

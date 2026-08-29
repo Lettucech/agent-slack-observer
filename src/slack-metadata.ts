@@ -11,7 +11,7 @@ export class SlackMetadataSync {
   private readonly workspaceRequests = new Map<string, Promise<void>>();
   private retryNotBefore = 0;
 
-  constructor(private readonly botToken: string, private readonly database: Database) {}
+  constructor(private readonly readToken: string, private readonly database: Database) {}
 
   schedule(workspaceId: string, channelId: string, force = false): void {
     const key = `${workspaceId}:${channelId}`;
@@ -58,7 +58,7 @@ export class SlackMetadataSync {
   }
 
   private async slackGet(methodAndQuery: string): Promise<Record<string, unknown>> {
-    const response = await fetch(`https://slack.com/api/${methodAndQuery}`, { headers: { Authorization: `Bearer ${this.botToken}` } });
+    const response = await fetch(`https://slack.com/api/${methodAndQuery}`, { headers: { Authorization: `Bearer ${this.readToken}` } });
     if (response.status === 429) {
       const retryAfter = Number(response.headers.get("retry-after"));
       this.retryNotBefore = Date.now() + (Number.isFinite(retryAfter) ? retryAfter * 1000 : DEFAULT_RETRY_MS);
