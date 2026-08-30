@@ -51,13 +51,17 @@ export function dashboardSettings(settings: ObserverSettings): DashboardSettings
   };
 }
 
-/** Merges a dashboard submission with stored secrets. An empty secret field means keep the current value. */
+/** Merges a dashboard submission with stored secrets. An empty selected secret field means keep its current value. */
 export function settingsFromInput(existing: ObserverSettings, input: unknown): ObserverSettings {
   const body = record(input);
+  const slackReadTokenType = readTokenType(body);
+  const selectedToken = secret(body, slackReadTokenType === "user" ? "slackUserToken" : "slackBotToken")
+    ?? (slackReadTokenType === "user" ? existing.slackUserToken : existing.slackBotToken);
+  if (!selectedToken) throw new Error(`Slack ${slackReadTokenType === "user" ? "User" : "Bot"} Token is required`);
   const candidate: ObserverSettings = {
     slackAppToken: secret(body, "slackAppToken") ?? existing.slackAppToken,
-    slackUserToken: secret(body, "slackUserToken") ?? existing.slackUserToken,
-    slackBotToken: secret(body, "slackBotToken") ?? existing.slackBotToken,
+    slackUserToken: slackReadTokenType === "user" ? selectedToken : undefined,
+    slackBotToken: slackReadTokenType === "bot" ? selectedToken : undefined,
     mcpAuthToken: existing.mcpAuthToken,
     threadSettleSeconds: integer(body, "threadSettleSeconds", existing.threadSettleSeconds, 0, 3600),
     messageRetentionDays: integer(body, "messageRetentionDays", existing.messageRetentionDays, 1, 3650),
@@ -74,6 +78,7 @@ export function validateSettingsInput(input: unknown): ObserverSettings {
   const slackUserToken = optionalSecret(body, "slackUserToken");
   const slackBotToken = optionalSecret(body, "slackBotToken");
   if (!slackUserToken && !slackBotToken) throw new Error("A Slack user or bot token is required");
+  if (slackUserToken && slackBotToken) throw new Error("Choose only one Slack user or bot token");
   return {
     slackAppToken,
     slackUserToken,
@@ -105,6 +110,11 @@ function requiredSecret(body: Record<string, unknown>, name: string, label: stri
   return value;
 }
 function secret(body: Record<string, unknown>, name: string): string | undefined { return optionalSecret(body, name); }
+function readTokenType(body: Record<string, unknown>): "user" | "bot" {
+  const value = body.slackReadTokenType;
+  if (value !== "user" && value !== "bot") throw new Error("Choose a Slack User or Bot Token");
+  return value;
+}
 function integer(body: Record<string, unknown>, name: string, fallback: number, minimum: number, maximum: number): number {
   const value = body[name];
   if (value === undefined || value === null || value === "") return fallback;

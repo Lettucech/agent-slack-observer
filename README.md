@@ -18,7 +18,7 @@ The observer never uses Slack MCP or posts a reply. It can record a consumer's s
 
 2. Open `http://localhost:3000`. The dashboard starts even with no Slack credentials.
 
-3. In **Connection and retention settings**, enter the Slack App Token and either a User or Bot Token. Use **Test connection** before saving; it verifies Slack without writing settings or starting Socket Mode. Save to activate the observer immediately. The dashboard generates an MCP bearer token on the first save and displays it once.
+3. In **Connection and retention settings**, enter the Slack App Token and choose either a User or Bot Token. The dashboard stores only that choice and removes the unselected read token when you save. Use **Test connection** before saving; it verifies Slack without writing settings or starting Socket Mode. Save to activate the observer immediately. The dashboard generates an MCP bearer token on the first save and displays it once.
 
 The MCP endpoint is `http://localhost:3000/mcp` and requires the Bearer token generated or rotated in the dashboard.
 
@@ -31,8 +31,8 @@ The dashboard stores Slack credentials, the generated MCP bearer token, and runt
 | Dashboard setting | Default | Purpose |
 | --- | --- | --- |
 | Slack App Token | — | Opens and reconnects the outbound Socket Mode WebSocket. |
-| Slack User Token | — | Recommended for explicit user-visible conversation discovery and Slack reads. |
-| Slack Bot Token | — | Read-token fallback when a user token is unavailable. |
+| Slack User Token | — | Choose this for explicit user-visible conversation discovery and Slack reads. |
+| Slack Bot Token | — | Choose this for channels where the installed bot has access. Only one Slack read token is stored. |
 | MCP bearer token | Generated on first save | Authenticates agents to `/mcp`; rotate it from the dashboard when needed. |
 | Thread settle seconds | 90 | Wait before MCP offers an active thread to an agent. |
 | Message retention days | 30 | Retain normalized message and thread context. |
@@ -63,13 +63,13 @@ This service does **not** create or install the Slack app. Each user does that i
 6. Reinstall or re-authorise after scope changes. For user-visible observation, paste the authorising user's `xoxp-…` token into **Slack User Token**; otherwise paste the app's `xoxb-…` token into **Slack Bot Token**.
 7. Test and save the dashboard settings. With a user token, use **Sync user-visible conversations** to register public channels, private channels, DMs, and group DMs that token can see. This is a deliberate local action, not a startup task. Without it, add quiet channels by workspace and channel ID before the first backfill. Socket Mode channels are registered automatically after their first event.
 
-The observer uses the configured user token when present, otherwise its bot-token fallback, for `team.info`, `conversations.info`, and dashboard-created backfill. The user token alone is used for `auth.test` and explicit `conversations.list` discovery. No Slack API call is made by that discovery feature until its dashboard button is pressed.
+The observer uses the selected read token for `auth.test`, `team.info`, `conversations.info`, and dashboard-created backfill. A user-token selection additionally enables explicit `conversations.list` discovery. No Slack API call is made by that discovery feature until its dashboard button is pressed.
 
 ### User-visible observation and privacy
 
 The Slack user token is a user OAuth credential, not an app token. Request only these user scopes when the associated conversation types are needed: `channels:read`, `channels:history`, `groups:read`, `groups:history`, `im:read`, `im:history`, `mpim:read`, `mpim:history`. The discovery action includes DMs and group DMs, so clicking it expands local target registration to everything the authorising user can see. It stores conversation IDs and returned display names immediately; message content is only fetched by a subsequent **Initialize 30-day thread index** or **Fetch selected window** action and remains subject to retention.
 
-Slack tokens are stored in the local PostgreSQL volume so the dashboard can apply them without a process restart. The observer never returns them from dashboard or MCP endpoints, and it does not log them. Revoke a token in Slack to invalidate it; replacing the user token with a bot token makes the fallback active immediately.
+Slack tokens are stored in the local PostgreSQL volume so the dashboard can apply them without a process restart. The observer never returns them from dashboard or MCP endpoints, and it does not log them. Revoke a token in Slack to invalidate it; switching the selected read-token type removes the formerly selected token immediately on save.
 
 ## What happens on a new message
 

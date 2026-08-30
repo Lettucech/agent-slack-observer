@@ -18,6 +18,11 @@ const settingsToggle = document.querySelector("#settings-toggle");
 const settingsForm = document.querySelector("#settings-form");
 const settingsStatus = document.querySelector("#settings-status");
 const settingsState = document.querySelector("#settings-state");
+const readTokenTypeInputs = [...settingsForm.querySelectorAll("input[name=slackReadTokenType]")];
+const userTokenField = document.querySelector("#slack-user-token-field");
+const botTokenField = document.querySelector("#slack-bot-token-field");
+const userTokenInput = settingsForm.elements.namedItem("slackUserToken");
+const botTokenInput = settingsForm.elements.namedItem("slackBotToken");
 const testSettingsButton = document.querySelector("#test-settings");
 const saveSettingsButton = settingsForm.querySelector("button[type=submit]");
 const rotateMcpTokenButton = document.querySelector("#rotate-mcp-token");
@@ -45,6 +50,13 @@ function datetimeInput(date) { const offset = date.getTimezoneOffset() * 60_000;
 function formValues() { return Object.fromEntries(new FormData(settingsForm)); }
 function showMcpToken(token) { mcpToken.textContent = token; mcpTokenResult.hidden = false; }
 function buttonBySelector(selector) { return document.querySelector(selector); }
+function setReadTokenType(type) {
+  const usingUserToken = type === "user";
+  userTokenField.hidden = !usingUserToken;
+  botTokenField.hidden = usingUserToken;
+  userTokenInput.disabled = !usingUserToken;
+  botTokenInput.disabled = usingUserToken;
+}
 
 function setView(view, updateHash = true) {
   if (!pageTitles[view]) return;
@@ -75,9 +87,12 @@ function renderSettings(settings) {
   settingsState.classList.toggle("incomplete", !settings.configured);
   const numbers = ["threadSettleSeconds", "messageRetentionDays", "rawEventRetentionDays", "backfillRequestIntervalSeconds", "downtimeSuggestionSeconds"];
   numbers.forEach((name) => { const field = settingsForm.elements.namedItem(name); if (field && document.activeElement !== field) field.value = settings[name]; });
+  const readTokenType = settings.slackUserTokenConfigured ? "user" : "bot";
+  readTokenTypeInputs.forEach((input) => { input.checked = input.value === readTokenType; });
+  setReadTokenType(readTokenType);
   settingsStatus.textContent = settings.configured
-    ? `Saved locally. App: ${settings.slackAppTokenConfigured ? "configured" : "missing"}; user: ${settings.slackUserTokenConfigured ? "configured" : "not configured"}; bot: ${settings.slackBotTokenConfigured ? "configured" : "not configured"}. Leave secrets blank to keep them.`
-    : "Add an App Token and either a user or bot token. Test first; saving starts the observer and generates an MCP token.";
+    ? `Saved locally. App Token and ${readTokenType === "user" ? "User" : "Bot"} Token are configured. Leave the selected secret blank to keep it.`
+    : "Add an App Token and choose one Slack read token. Test first; saving starts the observer and generates an MCP token.";
   setupNotice.hidden = settings.configured;
   attentionDot.hidden = settings.configured;
   [syncNamesButton, initialBackfillButton, buttonBySelector("#target-form button"), buttonBySelector("#manual-backfill-form button")].forEach((button) => { button.disabled = !settings.configured; });
@@ -149,6 +164,7 @@ document.querySelector("[data-close-settings]").addEventListener("click", closeS
 document.querySelector("#open-setup").addEventListener("click", () => openSettings(document.querySelector("#open-setup")));
 document.querySelector("#refresh").addEventListener("click", refreshDashboard);
 document.querySelector("#copy-mcp-url").addEventListener("click", async () => { try { await navigator.clipboard.writeText(`${window.location.origin}/mcp`); document.querySelector("#endpoint-status").textContent = "MCP endpoint copied."; } catch { document.querySelector("#endpoint-status").textContent = "Copy unavailable; select the endpoint above."; } });
+readTokenTypeInputs.forEach((input) => input.addEventListener("change", () => { if (input.checked) setReadTokenType(input.value); }));
 
 testSettingsButton.addEventListener("click", async () => { testSettingsButton.disabled = true; settingsStatus.textContent = "Testing Slack credentials without saving or starting the observer…"; try { await post("/dashboard/settings/test", formValues()); settingsStatus.textContent = "Slack credentials are valid. Save to start observing."; } catch (cause) { settingsStatus.textContent = "Connection test failed. Check the tokens and Slack app scopes."; console.error(cause); } finally { testSettingsButton.disabled = false; } });
 settingsForm.addEventListener("submit", async (event) => { event.preventDefault(); saveSettingsButton.disabled = true; settingsStatus.textContent = "Saving settings and starting observer services…"; try { const result = await post("/dashboard/settings", formValues()); if (result.mcpAuthToken) showMcpToken(result.mcpAuthToken); settingsForm.querySelectorAll("input[type=password]").forEach((field) => { field.value = ""; }); settingsStatus.textContent = "Settings saved. Observer services now use the new configuration."; await refreshDashboard(); } catch (cause) { settingsStatus.textContent = "Settings could not be saved. Check the required values."; console.error(cause); } finally { saveSettingsButton.disabled = false; } });
