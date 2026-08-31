@@ -56,7 +56,7 @@ app.post("/dashboard/metadata/sync", async (_request, response, next) => {
   try { response.status(202).json({ queued: await runtime.syncMetadata() }); } catch (error) { next(error); }
 });
 app.get("/dashboard/backfill", async (_request, response, next) => {
-  try { response.json({ jobs: await database.listBackfillJobs(), suggestions: await database.listBackfillSuggestions() }); } catch (error) { next(error); }
+  try { response.json({ jobs: await database.listBackfillJobs() }); } catch (error) { next(error); }
 });
 app.post("/dashboard/targets", async (request, response, next) => {
   try {
@@ -64,6 +64,15 @@ app.post("/dashboard/targets", async (request, response, next) => {
     await database.addObservationTarget(workspaceId, channelId);
     runtime.scheduleMetadata(workspaceId, channelId);
     response.status(201).json({ workspaceId, channelId });
+  } catch (error) { next(error); }
+});
+app.post("/dashboard/targets/coverage", async (request, response, next) => {
+  try {
+    const workspaceId = inputString(request.body, "workspaceId"); const channelId = inputString(request.body, "channelId");
+    if (typeof request.body?.enabled !== "boolean") throw new Error("enabled must be a boolean");
+    await database.setObservationTargetEnabled(workspaceId, channelId, request.body.enabled);
+    if (request.body.enabled) runtime.scheduleMetadata(workspaceId, channelId);
+    response.status(204).end();
   } catch (error) { next(error); }
 });
 app.post("/dashboard/conversations/discover", async (_request, response, next) => {
@@ -84,16 +93,6 @@ app.post("/dashboard/backfill/manual", async (request, response, next) => {
     const created = await database.createBackfillJob("manual", startAt, endAt, settings.messageRetentionDays);
     runtime.wakeBackfill(); response.status(202).json(created);
   } catch (error) { next(error); }
-});
-app.post("/dashboard/backfill/suggestions/:id/accept", async (request, response, next) => {
-  try {
-    const settings = await database.observerSettings();
-    const created = await database.acceptBackfillSuggestion(validId(request.params.id), settings.messageRetentionDays);
-    runtime.wakeBackfill(); response.status(202).json(created);
-  } catch (error) { next(error); }
-});
-app.post("/dashboard/backfill/suggestions/:id/dismiss", async (request, response, next) => {
-  try { await database.dismissBackfillSuggestion(validId(request.params.id)); response.status(204).end(); } catch (error) { next(error); }
 });
 app.post("/dashboard/backfill/:id/cancel", async (request, response, next) => {
   try { await database.cancelBackfillJob(validId(request.params.id)); response.status(204).end(); } catch (error) { next(error); }

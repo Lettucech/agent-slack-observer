@@ -1,12 +1,12 @@
 # Agent Slack Observer
 
-An agent-facing, one-way Slack observer. Slack Events API payloads arrive over an outbound Socket Mode WebSocket and this service stores them, then exposes Slack-read MCP tools plus consumer-local delivery acknowledgements for an agent's own cron job. With an optional user token, the local dashboard can explicitly discover every conversation that authorised user can see and use the same user token for read-only backfill. Its dashboard can also create a user-approved, rate-limited backfill job when Socket Mode was unavailable.
+An agent-facing, one-way Slack observer. Slack Events API payloads arrive over an outbound Socket Mode WebSocket and this service stores them, then exposes Slack-read MCP tools plus consumer-local delivery acknowledgements for an agent's own cron job. With an optional user token, the local dashboard can find conversations the authorised user can see, then lets you explicitly include selected conversations in read-only recovery coverage. When Socket Mode has a confirmed gap, it automatically queues a rate-limited recovery for that coverage.
 
 ```text
 Slack channel → Slack Socket Mode → observer database → Slack-read MCP + local ack → agent cron
 ```
 
-The observer never uses Slack MCP or posts a reply. It can record a consumer's successful local digest acknowledgement, but this never alters Slack, deletes retained messages, or affects another consumer. It makes the narrow app-level `apps.connections.open` call required to establish its outbound Socket Mode WebSocket and low-frequency name lookups. `conversations.list`, `conversations.history`, and `conversations.replies` only run after a user explicitly clicks a dashboard action; it never calls Slack search or messaging APIs.
+The observer never uses Slack MCP or posts a reply. It can record a consumer's successful local digest acknowledgement, but this never alters Slack, deletes retained messages, or affects another consumer. It makes the narrow app-level `apps.connections.open` call required to establish its outbound Socket Mode WebSocket and low-frequency name lookups. `conversations.list` runs only after an explicit dashboard action; `conversations.history` and `conversations.replies` run for an explicit index/manual action or a detected Socket Mode recovery gap. It never calls Slack search or messaging APIs.
 
 ## Start it
 
@@ -44,7 +44,7 @@ The dashboard stores Slack credentials, the generated MCP bearer token, and runt
 | Message retention days | 30 | Retain normalized message and thread context. |
 | Raw event retention days | 7 | Retain raw Socket Mode and backfill payloads. |
 | Backfill interval seconds | 60 | Minimum spacing between history and replies calls. |
-| Downtime suggestion seconds | 300 | Socket gap required before suggesting a backfill. |
+| Recover Socket Mode gap after seconds | 300 | Minimum confirmed gap before an automatic recovery is queued. |
 
 ### Why the Slack App-Level Token is needed
 
@@ -65,13 +65,13 @@ This service does **not** create or install the Slack app. Each user does that i
 4. Under **Settings → Basic Information → App-Level Tokens**, choose **Generate Token and Scopes**, give it a name, select `connections:write`, and paste the generated `xapp-…` value into the dashboard's **Slack App Token** field.
 5. Under **Event Subscriptions**, enable only matching events: `message.channels`, `message.groups`, `message.im`, and/or `message.mpim`. For bot-only operation, add the installed bot to every observed channel. For user-visible observation, subscribe to the matching Workspace Events after the user has granted the corresponding user scopes. Slack filters those event deliveries to conversations the authorising user can see.
 6. Reinstall or re-authorise after scope changes. For user-visible observation, paste the authorising user's `xoxp-…` token into **Slack User Token**; otherwise paste the app's `xoxb-…` token into **Slack Bot Token**.
-7. Test and save the dashboard settings. With a user token, use **Sync user-visible conversations** to register public channels, private channels, DMs, and group DMs that token can see. This is a deliberate local action, not a startup task. Without it, add quiet channels by workspace and channel ID before the first backfill. Socket Mode channels are registered automatically after their first event.
+7. Test and save the dashboard settings. With a user token, use **Find accessible conversations** to list public channels, private channels, DMs, and group DMs that token can see, then click **Include** only for conversations you want in recovery coverage. Finding conversations stores names and IDs only; it does not read message content or add coverage automatically. Without it, include a quiet channel by workspace and channel ID. Socket Mode channels are included automatically after their first event.
 
 The observer uses the selected read token for `auth.test`, `team.info`, `conversations.info`, and dashboard-created backfill. A user-token selection additionally enables explicit `conversations.list` discovery. No Slack API call is made by that discovery feature until its dashboard button is pressed.
 
 ### User-visible observation and privacy
 
-The Slack user token is a user OAuth credential, not an app token. Request only these user scopes when the associated conversation types are needed: `channels:read`, `channels:history`, `groups:read`, `groups:history`, `im:read`, `im:history`, `mpim:read`, `mpim:history`. The discovery action includes DMs and group DMs, so clicking it expands local target registration to everything the authorising user can see. It stores conversation IDs and returned display names immediately; message content is only fetched by a subsequent **Initialize 30-day thread index** or **Fetch selected window** action and remains subject to retention.
+The Slack user token is a user OAuth credential, not an app token. Request only these user scopes when the associated conversation types are needed: `channels:read`, `channels:history`, `groups:read`, `groups:history`, `im:read`, `im:history`, `mpim:read`, `mpim:history`. Finding conversations can include DMs and group DMs, but it stores only conversation IDs and display names as excluded candidates. Message content is fetched only after you include a conversation and either build an index, request an exact window, or an automatic recovery is needed; it remains subject to retention.
 
 Slack tokens are stored in the local PostgreSQL volume so the dashboard can apply them without a process restart. The observer never returns them from dashboard or MCP endpoints, and it does not log them. Revoke a token in Slack to invalidate it; switching the selected read-token type removes the formerly selected token immediately on save.
 
@@ -94,9 +94,9 @@ The write happens before the socket acknowledgement and is intentionally small; 
 
 For a first-time index, let the dashboard job finish before allowing an agent to treat that historical range as a digest queue. Slack paginates history newest-first; the observer orders every returned digest by Slack timestamp, but it cannot make an unfinished remote scan complete instantly.
 
-The dashboard can also enqueue an explicit start/end time window. A detected Socket Mode disconnection produces only a suggested window; no Slack history call happens until a user clicks **Queue fetch**. Jobs are persistent and globally serial: each page cursor, retry time, and current task is stored in PostgreSQL, so a restart resumes at the next request. `429` responses respect Slack's `Retry-After` value.
+The dashboard can also enqueue an explicit start/end time window. After Socket Mode reconnects, a confirmed gap longer than the configured threshold automatically queues recovery for included conversations. That recovery is bounded to the actual missing window and the retention window, is persistent and globally serial, and can be cancelled from the dashboard. Each page cursor, retry time, and current task is stored in PostgreSQL, so a restart resumes at the next request. `429` responses respect Slack's `Retry-After` value.
 
-Backfill covers targets that you deliberately register. With a configured user token, the explicit **Sync user-visible conversations** action can register completely quiet conversations using `conversations.list`; otherwise the observer intentionally does not discover them. The full thread guarantee is bounded by the configured message retention window: an old root outside that retained index can only be reconstructed by a separate historical scan.
+Backfill covers only conversations in recovery coverage. With a configured user token, **Find accessible conversations** can list completely quiet conversations using `conversations.list`, but they remain excluded until you choose **Include**; otherwise the observer intentionally does not discover them. The full thread guarantee is bounded by the configured message retention window: an old root outside that retained index can only be reconstructed by a separate historical scan.
 
 ## Retention
 

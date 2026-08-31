@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { SlackConversationDiscovery } from "../src/slack-conversations.js";
 
-test("registers every active user-visible conversation over paginated Slack results", async () => {
+test("discovers every user-visible conversation over paginated Slack results", async () => {
   const originalFetch = globalThis.fetch;
   const calls: Array<{ url: string; authorization: string | null }> = [];
   const registered: Array<{ workspaceId: string; workspaceName: string | null; conversations: unknown[] }> = [];

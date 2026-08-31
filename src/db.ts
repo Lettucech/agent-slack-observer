@@ -98,11 +98,6 @@ export class Database {
         updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
       );
       INSERT INTO observer_settings (singleton) VALUES (true) ON CONFLICT (singleton) DO NOTHING;
-      CREATE TABLE IF NOT EXISTS backfill_suggestions (
-        id BIGSERIAL PRIMARY KEY, start_at TIMESTAMPTZ NOT NULL, end_at TIMESTAMPTZ NOT NULL,
-        state TEXT NOT NULL DEFAULT 'pending' CHECK (state IN ('pending', 'accepted', 'dismissed')),
-        created_at TIMESTAMPTZ NOT NULL DEFAULT now(), UNIQUE (start_at, end_at)
-      );
     `);
   }
 
@@ -205,7 +200,7 @@ export class Database {
       const job = await client.query<{ id: string }>(
         `INSERT INTO backfill_jobs (kind, requested_start_at, requested_end_at) VALUES ($1, $2, $3) RETURNING id`, [kind, startAt, endAt],
       );
-      const scanStart = new Date(endAt.getTime() - retentionDays * 86_400_000).toISOString();
+      const scanStart = backfillWindow(startAt, endAt, retentionDays).startAt.toISOString();
       for (const target of targets.rows) {
         await client.query(
           `INSERT INTO backfill_tasks (job_id, workspace_id, channel_id, phase, oldest, latest) VALUES ($1, $2, $3, 'history', $4, $5)`,
@@ -229,8 +224,8 @@ export class Database {
           ON CONFLICT (workspace_id) DO UPDATE SET workspace_name = EXCLUDED.workspace_name, last_synced_at = now(), last_attempted_at = now(), last_error = NULL`, [workspaceId, workspaceName]);
       }
       for (const conversation of conversations) {
-        await client.query(`INSERT INTO observation_targets (workspace_id, channel_id) VALUES ($1, $2)
-          ON CONFLICT (workspace_id, channel_id) DO UPDATE SET enabled = true, updated_at = now()`, [workspaceId, conversation.channelId]);
+        await client.query(`INSERT INTO observation_targets (workspace_id, channel_id, enabled) VALUES ($1, $2, false)
+          ON CONFLICT (workspace_id, channel_id) DO UPDATE SET updated_at = now()`, [workspaceId, conversation.channelId]);
         if (conversation.channelName) {
           await client.query(`INSERT INTO channel_metadata (workspace_id, channel_id, channel_name, last_synced_at, last_attempted_at, last_error)
             VALUES ($1, $2, $3, now(), now(), NULL)
@@ -286,28 +281,30 @@ export class Database {
     await this.pool.query(`UPDATE backfill_runtime SET next_request_at = $1, last_error = $2, updated_at = now() WHERE singleton`, [nextRequestAt, error]);
   }
 
-  async markSocketConnected(minGapSeconds: number): Promise<void> {
+  async markSocketConnected(minGapSeconds: number, retentionDays: number): Promise<{ job: BackfillJob; targetCount: number } | undefined> {
     const result = await this.pool.query<{ checkpoint: string | null }>(
       `SELECT COALESCE(last_disconnected_at, last_event_at, last_connected_at)::text AS checkpoint FROM observer_health WHERE singleton`,
     );
     const checkpoint = result.rows[0].checkpoint;
-    if (checkpoint && Date.now() - new Date(checkpoint).getTime() >= minGapSeconds * 1000) {
-      await this.pool.query(`INSERT INTO backfill_suggestions (start_at, end_at) VALUES ($1, now()) ON CONFLICT DO NOTHING`, [checkpoint]);
-    }
-    await this.pool.query(`UPDATE observer_health SET socket_state = 'connected', last_connected_at = now(), updated_at = now() WHERE singleton`);
+    const now = new Date();
+    await this.pool.query(`UPDATE observer_health SET socket_state = 'connected', last_connected_at = $1, last_disconnected_at = NULL, updated_at = $1 WHERE singleton`, [now]);
+    const recoveryWindow = detectedRecoveryWindow(checkpoint ? new Date(checkpoint) : null, now, minGapSeconds, retentionDays);
+    return recoveryWindow ? this.queueAutomaticRecovery(recoveryWindow.startAt, recoveryWindow.endAt, retentionDays) : undefined;
   }
   async markSocketDisconnected(): Promise<void> { await this.pool.query(`UPDATE observer_health SET socket_state = 'disconnected', last_disconnected_at = now(), updated_at = now() WHERE singleton`); }
   async markSocketEvent(): Promise<void> { await this.pool.query(`UPDATE observer_health SET last_event_at = now(), updated_at = now() WHERE singleton`); }
-  async listBackfillSuggestions(): Promise<Array<{ id: number; startAt: string; endAt: string }>> {
-    const result = await this.pool.query<{ id: string; start_at: string; end_at: string }>(`SELECT id::text, start_at::text, end_at::text FROM backfill_suggestions WHERE state = 'pending' ORDER BY start_at DESC`);
-    return result.rows.map((row) => ({ id: Number(row.id), startAt: row.start_at, endAt: row.end_at }));
+  async promotePendingBackfillSuggestions(retentionDays: number): Promise<number> {
+    const table = await this.pool.query<{ name: string | null }>("SELECT to_regclass('backfill_suggestions')::text AS name");
+    if (!table.rows[0]?.name) return 0;
+    const pending = await this.pool.query<{ id: string; start_at: string; end_at: string }>(
+      "SELECT id::text, start_at::text, end_at::text FROM backfill_suggestions WHERE state = 'pending' ORDER BY id",
+    );
+    for (const suggestion of pending.rows) {
+      await this.queueAutomaticRecovery(new Date(suggestion.start_at), new Date(suggestion.end_at), retentionDays);
+      await this.pool.query("UPDATE backfill_suggestions SET state = 'accepted' WHERE id = $1 AND state = 'pending'", [suggestion.id]);
+    }
+    return pending.rowCount ?? 0;
   }
-  async acceptBackfillSuggestion(id: number, retentionDays: number): Promise<{ job: BackfillJob; targetCount: number }> {
-    const item = await this.pool.query<{ start_at: string; end_at: string }>(`UPDATE backfill_suggestions SET state = 'accepted' WHERE id = $1 AND state = 'pending' RETURNING start_at::text, end_at::text`, [id]);
-    if (!item.rowCount) throw new Error("Backfill suggestion is unavailable");
-    return this.createBackfillJob("downtime", new Date(item.rows[0].start_at), new Date(item.rows[0].end_at), retentionDays);
-  }
-  async dismissBackfillSuggestion(id: number): Promise<void> { await this.pool.query(`UPDATE backfill_suggestions SET state = 'dismissed' WHERE id = $1 AND state = 'pending'`, [id]); }
 
   async purgeExpired(rawEventRetentionDays: number, messageRetentionDays: number): Promise<void> {
     await this.pool.query(`DELETE FROM slack_events WHERE received_at < now() - make_interval(days => $1)`, [rawEventRetentionDays]);
@@ -433,6 +430,17 @@ export class Database {
   }
   async close(): Promise<void> { await this.pool.end(); }
 
+  private async queueAutomaticRecovery(startAt: Date, endAt: Date, retentionDays: number): Promise<{ job: BackfillJob; targetCount: number }> {
+    const window = backfillWindow(startAt, endAt, retentionDays);
+    const existing = await this.pool.query<{ id: string }>(
+      `SELECT id::text FROM backfill_jobs
+       WHERE kind = 'downtime' AND state IN ('queued', 'running')
+         AND requested_start_at <= $2 AND requested_end_at >= $1
+       LIMIT 1`, [window.startAt, window.endAt],
+    );
+    if (existing.rowCount) return { job: await this.getBackfillJob(Number(existing.rows[0].id)), targetCount: 0 };
+    return this.createBackfillJob("downtime", window.startAt, window.endAt, retentionDays);
+  }
   private async upsertTarget(workspaceId: string, channelId: string): Promise<void> { await this.pool.query(`INSERT INTO observation_targets (workspace_id, channel_id) VALUES ($1, $2) ON CONFLICT (workspace_id, channel_id) DO UPDATE SET updated_at = now()`, [workspaceId, channelId]); }
   private async insertMessageIfAbsent(eventId: string, eventSequence: number, workspaceId: string, channelId: string, message: Record<string, unknown>, observedAt: string, client: Pool | PoolClient = this.pool): Promise<void> {
     const exists = await client.query<{ event_id: string }>(`SELECT event_id FROM messages WHERE workspace_id = $1 AND channel_id = $2 AND message_ts = $3 LIMIT 1`, [workspaceId, channelId, message.ts]);
@@ -470,4 +478,15 @@ export function historyCheckpointStatement(taskId: number, cursor: string | null
     text: `UPDATE backfill_tasks SET cursor = $2, state = 'queued', completed_at = NULL, updated_at = now(), last_error = NULL WHERE id = $1`,
     values: [taskId, cursor],
   };
+}
+
+/** Keeps every requested fetch within the retained local context window. */
+export function backfillWindow(requestedStartAt: Date, requestedEndAt: Date, retentionDays: number): { startAt: Date; endAt: Date } {
+  const retainedStartAt = new Date(requestedEndAt.getTime() - retentionDays * 86_400_000);
+  return { startAt: new Date(Math.max(requestedStartAt.getTime(), retainedStartAt.getTime())), endAt: new Date(requestedEndAt) };
+}
+
+export function detectedRecoveryWindow(checkpoint: Date | null, recoveredAt: Date, minGapSeconds: number, retentionDays: number): { startAt: Date; endAt: Date } | undefined {
+  if (!checkpoint || recoveredAt.getTime() - checkpoint.getTime() < minGapSeconds * 1000) return undefined;
+  return backfillWindow(checkpoint, recoveredAt, retentionDays);
 }

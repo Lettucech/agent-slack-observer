@@ -24,17 +24,20 @@ export class ObserverRuntime {
       messageRetentionDays: settings.messageRetentionDays,
     });
     this.backfill.start();
+    if (await this.database.promotePendingBackfillSuggestions(settings.messageRetentionDays)) this.backfill.wake();
     this.discovery = settings.slackUserToken ? new SlackConversationDiscovery(settings.slackUserToken, this.database) : undefined;
     if (settings.slackAppToken) {
       this.socket = new SocketModeObserver(settings.slackAppToken, this.database, (workspaceId, channelId) => this.metadata?.schedule(workspaceId, channelId), {
-        connected: () => void this.database.markSocketConnected(settings.downtimeSuggestionSeconds).catch(console.error),
+        connected: () => void this.database.markSocketConnected(settings.downtimeSuggestionSeconds, settings.messageRetentionDays)
+          .then((recovery) => { if (recovery) this.backfill?.wake(); })
+          .catch(console.error),
         disconnected: () => void this.database.markSocketDisconnected().catch(console.error),
         eventStored: () => void this.database.markSocketEvent().catch(console.error),
       });
       this.socket.start();
     }
     const channels = await this.database.listChannels();
-    channels.forEach((channel) => this.metadata?.schedule(channel.workspaceId, channel.channelId));
+    channels.filter((channel) => channel.enabled).forEach((channel) => this.metadata?.schedule(channel.workspaceId, channel.channelId));
   }
 
   stop(): void {
@@ -57,8 +60,9 @@ export class ObserverRuntime {
   async syncMetadata(): Promise<number> {
     if (!this.metadata) throw new Error("Configure a Slack read token in Settings before syncing metadata");
     const channels = await this.database.listChannels();
-    channels.forEach((channel) => this.metadata?.schedule(channel.workspaceId, channel.channelId, true));
-    return channels.length;
+    const covered = channels.filter((channel) => channel.enabled);
+    covered.forEach((channel) => this.metadata?.schedule(channel.workspaceId, channel.channelId, true));
+    return covered.length;
   }
   wakeBackfill(): void {
     if (!this.backfill) throw new Error("Configure a Slack read token in Settings before creating a backfill job");
