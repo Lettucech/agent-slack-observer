@@ -36,7 +36,7 @@ test("creates a fresh stateless MCP transport for each HTTP request", async () =
 test("uses a consumer inbox without requiring an agent cursor and acknowledges only supplied events", async () => {
   const pendingCalls: Array<{ consumerId: string; upperSequence: number; settleSeconds: number }> = [];
   const acknowledgements: Array<{ consumerId: string; eventIds: string[] }> = [];
-  const messages: StoredMessage[] = [{ eventId: "Ev1", eventSequence: 1, workspaceId: "T1", channelId: "C1", messageTs: "1000.0", threadTs: null, userId: "U1", subtype: null, text: "pending", payload: {}, observedAt: "2026-08-13T00:00:00Z" }];
+  const messages: StoredMessage[] = [{ eventId: "Ev1", eventSequence: 1, workspaceId: "T1", channelId: "C1", conversationType: "private_channel", messageTs: "1000.0", threadTs: null, userId: "U1", subtype: null, text: "pending", payload: {}, observedAt: "2026-08-13T00:00:00Z" }];
   const acknowledged = new Map<string, Set<string>>();
   const database = {
     latestSequence: async () => 9,
@@ -62,9 +62,10 @@ test("uses a consumer inbox without requiring an agent cursor and acknowledges o
   await client.connect(clientTransport);
   try {
     const digest = await client.callTool({ name: "get_digest_batches", arguments: { consumerId: "hermes", afterSequence: 999, maxTokens: 1000 } });
-    const digestBatch = digest.structuredContent as { groups: Array<{ ackToken?: string }> };
+    const digestBatch = digest.structuredContent as { groups: Array<{ ackToken?: string; conversationType: string }> };
     assert.equal(digestBatch.groups.length, 1);
     assert.equal(typeof digestBatch.groups[0].ackToken, "string");
+    assert.equal(digestBatch.groups[0].conversationType, "private_channel");
     assert.deepEqual(pendingCalls, [{ consumerId: "hermes", upperSequence: 9, settleSeconds: 90 }]);
 
     const ack = await client.callTool({ name: "ack_digest", arguments: { ackToken: digestBatch.groups[0].ackToken } });
@@ -82,7 +83,7 @@ test("uses a consumer inbox without requiring an agent cursor and acknowledges o
 });
 
 test("continues an oversized message without dropping text", async () => {
-  const oversized: StoredMessage = { eventId: "Ev-large", eventSequence: 1, workspaceId: "T1", channelId: "C1", messageTs: "1000.0", threadTs: null, userId: "U1", subtype: null, text: "x".repeat(500), payload: { blocks: "ignored" }, observedAt: "2026-08-13T00:00:00Z" };
+  const oversized: StoredMessage = { eventId: "Ev-large", eventSequence: 1, workspaceId: "T1", channelId: "C1", conversationType: "unknown", messageTs: "1000.0", threadTs: null, userId: "U1", subtype: null, text: "x".repeat(500), payload: { blocks: "ignored" }, observedAt: "2026-08-13T00:00:00Z" };
   const database = { getMessage: async () => oversized } as unknown as Database;
   const { server } = createMcpTransport(database, 90);
   const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
@@ -113,7 +114,7 @@ test("continues an oversized message without dropping text", async () => {
 });
 
 test("normalizes numeric Slack timestamps coerced by an MCP client", async () => {
-  const message: StoredMessage = { eventId: "Ev-ts", eventSequence: 1, workspaceId: "T1", channelId: "C1", messageTs: "1786501755.941399", threadTs: null, userId: "U1", subtype: null, text: "one", payload: {}, observedAt: "2026-08-13T00:00:00Z" };
+  const message: StoredMessage = { eventId: "Ev-ts", eventSequence: 1, workspaceId: "T1", channelId: "C1", conversationType: "unknown", messageTs: "1786501755.941399", threadTs: null, userId: "U1", subtype: null, text: "one", payload: {}, observedAt: "2026-08-13T00:00:00Z" };
   const messageLookups: string[] = [];
   const threadLookups: Array<{ threadTs: string; afterMessageTs: string | undefined }> = [];
   const database = {

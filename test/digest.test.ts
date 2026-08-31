@@ -4,7 +4,7 @@ import { makeDigestBatch } from "../src/digest.js";
 import type { StoredMessage } from "../src/types.js";
 
 function message(sequence: number, ts: string, text: string, threadTs: string | null = null, payload: Record<string, unknown> = {}): StoredMessage {
-  return { eventId: `Ev${sequence}`, eventSequence: sequence, workspaceId: "T1", channelId: "C1", messageTs: ts, threadTs, userId: "U1", subtype: null, text, payload, observedAt: "2026-08-11T00:00:00Z" };
+  return { eventId: `Ev${sequence}`, eventSequence: sequence, workspaceId: "T1", channelId: "C1", conversationType: "im", messageTs: ts, threadTs, userId: "U1", subtype: null, text, payload, observedAt: "2026-08-11T00:00:00Z" };
 }
 
 test("keeps a thread together even when unrelated messages arrive between replies", () => {
@@ -15,6 +15,7 @@ test("keeps a thread together even when unrelated messages arrive between replie
   assert.equal(batch.groups.length, 2);
   const thread = batch.groups.find((group) => group.kind === "thread");
   assert.deepEqual(thread?.messages.map((item) => item.eventId), ["Ev1", "Ev3"]);
+  assert.equal(thread?.conversationType, "im");
 });
 
 test("splits an oversized thread with its root message retained", () => {

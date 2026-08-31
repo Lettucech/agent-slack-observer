@@ -2,6 +2,7 @@ import { Pool, type PoolClient } from "pg";
 import type { StoredMessage } from "./types.js";
 import type { UserVisibleConversation } from "./slack-conversations.js";
 import { defaultSettings, type ObserverSettings } from "./settings.js";
+import { conversationTypeFromSlackChannel, conversationTypeFromStoredValue, type ConversationType } from "./slack-conversation-type.js";
 
 export type SlackEnvelope = { event_id?: unknown; team_id?: unknown; api_app_id?: unknown; type?: unknown; event?: unknown };
 export type SlackHistoryMessage = Record<string, unknown> & { ts: string; type?: string; thread_ts?: string; reply_count?: number; latest_reply?: string };
@@ -47,9 +48,10 @@ export class Database {
         workspace_id TEXT PRIMARY KEY, workspace_name TEXT, last_synced_at TIMESTAMPTZ, last_attempted_at TIMESTAMPTZ, last_error TEXT
       );
       CREATE TABLE IF NOT EXISTS channel_metadata (
-        workspace_id TEXT NOT NULL, channel_id TEXT NOT NULL, channel_name TEXT, last_synced_at TIMESTAMPTZ, last_attempted_at TIMESTAMPTZ, last_error TEXT,
+        workspace_id TEXT NOT NULL, channel_id TEXT NOT NULL, channel_name TEXT, conversation_type TEXT NOT NULL DEFAULT 'unknown', last_synced_at TIMESTAMPTZ, last_attempted_at TIMESTAMPTZ, last_error TEXT,
         PRIMARY KEY (workspace_id, channel_id)
       );
+      ALTER TABLE channel_metadata ADD COLUMN IF NOT EXISTS conversation_type TEXT NOT NULL DEFAULT 'unknown';
       CREATE TABLE IF NOT EXISTS observation_targets (
         workspace_id TEXT NOT NULL, channel_id TEXT NOT NULL, enabled BOOLEAN NOT NULL DEFAULT true,
         created_at TIMESTAMPTZ NOT NULL DEFAULT now(), updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
@@ -114,6 +116,7 @@ export class Database {
     const eventSequence = Number(insert.rows[0].event_sequence);
     if (event.type === "message" && typeof event.channel === "string" && typeof event.ts === "string") {
       await this.upsertTarget(workspaceId, event.channel);
+      await this.saveChannelConversationType(workspaceId, event.channel, conversationTypeFromSlackChannel(event));
       await this.insertMessageIfAbsent(eventId, eventSequence, workspaceId, event.channel, event, new Date().toISOString());
     }
     return { inserted: true, eventSequence };
@@ -226,11 +229,9 @@ export class Database {
       for (const conversation of conversations) {
         await client.query(`INSERT INTO observation_targets (workspace_id, channel_id, enabled) VALUES ($1, $2, false)
           ON CONFLICT (workspace_id, channel_id) DO UPDATE SET updated_at = now()`, [workspaceId, conversation.channelId]);
-        if (conversation.channelName) {
-          await client.query(`INSERT INTO channel_metadata (workspace_id, channel_id, channel_name, last_synced_at, last_attempted_at, last_error)
-            VALUES ($1, $2, $3, now(), now(), NULL)
-            ON CONFLICT (workspace_id, channel_id) DO UPDATE SET channel_name = EXCLUDED.channel_name, last_synced_at = now(), last_attempted_at = now(), last_error = NULL`, [workspaceId, conversation.channelId, conversation.channelName]);
-        }
+        await client.query(`INSERT INTO channel_metadata (workspace_id, channel_id, channel_name, conversation_type, last_synced_at, last_attempted_at, last_error)
+          VALUES ($1, $2, $3, $4, now(), now(), NULL)
+          ON CONFLICT (workspace_id, channel_id) DO UPDATE SET channel_name = COALESCE(EXCLUDED.channel_name, channel_metadata.channel_name), conversation_type = CASE WHEN EXCLUDED.conversation_type = 'unknown' THEN channel_metadata.conversation_type ELSE EXCLUDED.conversation_type END, last_synced_at = now(), last_attempted_at = now(), last_error = NULL`, [workspaceId, conversation.channelId, conversation.channelName, conversation.conversationType]);
       }
       await client.query("COMMIT");
     } catch (error) { await client.query("ROLLBACK"); throw error; } finally { client.release(); }
@@ -372,23 +373,23 @@ export class Database {
     return result.rows[0] ? toStoredMessage(result.rows[0]) : undefined;
   }
 
-  async listChannels(): Promise<Array<{ workspaceId: string; workspaceName: string | null; channelId: string; channelName: string | null; enabled: boolean; messageCount: number; lastObservedAt: string | null }>> {
+  async listChannels(): Promise<Array<{ workspaceId: string; workspaceName: string | null; channelId: string; channelName: string | null; conversationType: ConversationType; enabled: boolean; messageCount: number; lastObservedAt: string | null }>> {
     const result = await this.pool.query<ChannelRow>(
-      `SELECT t.workspace_id, wm.workspace_name, t.channel_id, cm.channel_name, t.enabled, count(m.event_id)::text AS message_count, max(m.observed_at)::text AS last_observed_at
+      `SELECT t.workspace_id, wm.workspace_name, t.channel_id, cm.channel_name, cm.conversation_type, t.enabled, count(m.event_id)::text AS message_count, max(m.observed_at)::text AS last_observed_at
        FROM observation_targets t LEFT JOIN messages m ON m.workspace_id = t.workspace_id AND m.channel_id = t.channel_id
        LEFT JOIN workspace_metadata wm ON wm.workspace_id = t.workspace_id LEFT JOIN channel_metadata cm ON cm.workspace_id = t.workspace_id AND cm.channel_id = t.channel_id
-       GROUP BY t.workspace_id, wm.workspace_name, t.channel_id, cm.channel_name, t.enabled ORDER BY max(m.observed_at) DESC NULLS LAST, t.channel_id`,
+      GROUP BY t.workspace_id, wm.workspace_name, t.channel_id, cm.channel_name, cm.conversation_type, t.enabled ORDER BY max(m.observed_at) DESC NULLS LAST, t.channel_id`,
     );
-    return result.rows.map((row) => ({ workspaceId: row.workspace_id, workspaceName: row.workspace_name, channelId: row.channel_id, channelName: row.channel_name, enabled: row.enabled, messageCount: Number(row.message_count), lastObservedAt: row.last_observed_at }));
+    return result.rows.map((row) => ({ workspaceId: row.workspace_id, workspaceName: row.workspace_name, channelId: row.channel_id, channelName: row.channel_name, conversationType: conversationTypeFromStoredValue(row.conversation_type), enabled: row.enabled, messageCount: Number(row.message_count), lastObservedAt: row.last_observed_at }));
   }
   async metadataLookupDue(workspaceId: string, channelId: string, maxAgeHours = 24): Promise<{ workspace: boolean; channel: boolean }> {
     const result = await this.pool.query<{ workspace_due: boolean; channel_due: boolean }>(
       `SELECT NOT EXISTS (SELECT 1 FROM workspace_metadata WHERE workspace_id = $1 AND ((workspace_name IS NOT NULL AND last_synced_at > now() - make_interval(hours => $3)) OR last_attempted_at > now() - interval '15 minutes')) AS workspace_due,
-       NOT EXISTS (SELECT 1 FROM channel_metadata WHERE workspace_id = $1 AND channel_id = $2 AND ((channel_name IS NOT NULL AND last_synced_at > now() - make_interval(hours => $3)) OR last_attempted_at > now() - interval '15 minutes')) AS channel_due`, [workspaceId, channelId, maxAgeHours]);
+       NOT EXISTS (SELECT 1 FROM channel_metadata WHERE workspace_id = $1 AND channel_id = $2 AND conversation_type <> 'unknown' AND ((channel_name IS NOT NULL AND last_synced_at > now() - make_interval(hours => $3)) OR last_attempted_at > now() - interval '15 minutes')) AS channel_due`, [workspaceId, channelId, maxAgeHours]);
     return { workspace: result.rows[0].workspace_due, channel: result.rows[0].channel_due };
   }
   async saveWorkspaceMetadata(workspaceId: string, workspaceName: string): Promise<void> { await this.pool.query(`INSERT INTO workspace_metadata (workspace_id, workspace_name, last_synced_at, last_attempted_at, last_error) VALUES ($1, $2, now(), now(), NULL) ON CONFLICT (workspace_id) DO UPDATE SET workspace_name = EXCLUDED.workspace_name, last_synced_at = now(), last_attempted_at = now(), last_error = NULL`, [workspaceId, workspaceName]); }
-  async saveChannelMetadata(workspaceId: string, channelId: string, channelName: string): Promise<void> { await this.pool.query(`INSERT INTO channel_metadata (workspace_id, channel_id, channel_name, last_synced_at, last_attempted_at, last_error) VALUES ($1, $2, $3, now(), now(), NULL) ON CONFLICT (workspace_id, channel_id) DO UPDATE SET channel_name = EXCLUDED.channel_name, last_synced_at = now(), last_attempted_at = now(), last_error = NULL`, [workspaceId, channelId, channelName]); }
+  async saveChannelMetadata(workspaceId: string, channelId: string, channelName: string, conversationType: ConversationType): Promise<void> { await this.pool.query(`INSERT INTO channel_metadata (workspace_id, channel_id, channel_name, conversation_type, last_synced_at, last_attempted_at, last_error) VALUES ($1, $2, $3, $4, now(), now(), NULL) ON CONFLICT (workspace_id, channel_id) DO UPDATE SET channel_name = EXCLUDED.channel_name, conversation_type = CASE WHEN EXCLUDED.conversation_type = 'unknown' THEN channel_metadata.conversation_type ELSE EXCLUDED.conversation_type END, last_synced_at = now(), last_attempted_at = now(), last_error = NULL`, [workspaceId, channelId, channelName, conversationType]); }
   async saveMetadataError(workspaceId: string, channelId: string, error: string): Promise<void> {
     await this.pool.query(`INSERT INTO workspace_metadata (workspace_id, last_attempted_at, last_error) VALUES ($1, now(), $2) ON CONFLICT (workspace_id) DO UPDATE SET last_attempted_at = now(), last_error = EXCLUDED.last_error`, [workspaceId, error]);
     await this.pool.query(`INSERT INTO channel_metadata (workspace_id, channel_id, last_attempted_at, last_error) VALUES ($1, $2, now(), $3) ON CONFLICT (workspace_id, channel_id) DO UPDATE SET last_attempted_at = now(), last_error = EXCLUDED.last_error`, [workspaceId, channelId, error]);
@@ -442,6 +443,7 @@ export class Database {
     return this.createBackfillJob("downtime", window.startAt, window.endAt, retentionDays);
   }
   private async upsertTarget(workspaceId: string, channelId: string): Promise<void> { await this.pool.query(`INSERT INTO observation_targets (workspace_id, channel_id) VALUES ($1, $2) ON CONFLICT (workspace_id, channel_id) DO UPDATE SET updated_at = now()`, [workspaceId, channelId]); }
+  private async saveChannelConversationType(workspaceId: string, channelId: string, conversationType: ConversationType): Promise<void> { await this.pool.query(`INSERT INTO channel_metadata (workspace_id, channel_id, conversation_type) VALUES ($1, $2, $3) ON CONFLICT (workspace_id, channel_id) DO UPDATE SET conversation_type = CASE WHEN EXCLUDED.conversation_type = 'unknown' THEN channel_metadata.conversation_type ELSE EXCLUDED.conversation_type END`, [workspaceId, channelId, conversationType]); }
   private async insertMessageIfAbsent(eventId: string, eventSequence: number, workspaceId: string, channelId: string, message: Record<string, unknown>, observedAt: string, client: Pool | PoolClient = this.pool): Promise<void> {
     const exists = await client.query<{ event_id: string }>(`SELECT event_id FROM messages WHERE workspace_id = $1 AND channel_id = $2 AND message_ts = $3 LIMIT 1`, [workspaceId, channelId, message.ts]);
     if (exists.rowCount) return;
@@ -451,13 +453,13 @@ export class Database {
   private async getBackfillJob(id: number): Promise<BackfillJob> { const jobs = await this.pool.query<JobRow>(`SELECT j.id::text, j.kind, j.state, j.requested_start_at::text, j.requested_end_at::text, j.created_at::text, j.completed_at::text, j.last_error, count(DISTINCT (t.workspace_id, t.channel_id))::text AS channels, count(*) FILTER (WHERE t.state = 'completed')::text AS completed_tasks, count(*)::text AS total_tasks, count(*) FILTER (WHERE t.phase = 'history')::text AS history_tasks, count(*) FILTER (WHERE t.phase = 'replies')::text AS reply_tasks FROM backfill_jobs j LEFT JOIN backfill_tasks t ON t.job_id = j.id WHERE j.id = $1 GROUP BY j.id`, [id]); return toJob(jobs.rows[0]); }
 }
 
-const messageSelect = `SELECT m.event_id, m.event_sequence::text, m.workspace_id, m.channel_id, m.message_ts, m.thread_ts, m.user_id, m.subtype, m.text, m.event_payload, m.observed_at::text, wm.workspace_name, cm.channel_name FROM messages m LEFT JOIN workspace_metadata wm USING (workspace_id) LEFT JOIN channel_metadata cm USING (workspace_id, channel_id)`;
-type MessageRow = { event_id: string; event_sequence: string; workspace_id: string; channel_id: string; message_ts: string; thread_ts: string | null; user_id: string | null; subtype: string | null; text: string | null; event_payload: Record<string, unknown>; observed_at: string; workspace_name: string | null; channel_name: string | null };
+const messageSelect = `SELECT m.event_id, m.event_sequence::text, m.workspace_id, m.channel_id, m.message_ts, m.thread_ts, m.user_id, m.subtype, m.text, m.event_payload, m.observed_at::text, wm.workspace_name, cm.channel_name, cm.conversation_type FROM messages m LEFT JOIN workspace_metadata wm USING (workspace_id) LEFT JOIN channel_metadata cm USING (workspace_id, channel_id)`;
+type MessageRow = { event_id: string; event_sequence: string; workspace_id: string; channel_id: string; message_ts: string; thread_ts: string | null; user_id: string | null; subtype: string | null; text: string | null; event_payload: Record<string, unknown>; observed_at: string; workspace_name: string | null; channel_name: string | null; conversation_type: string | null };
 type TaskRow = { id: string; job_id: string; workspace_id: string; channel_id: string; phase: "history" | "replies"; cursor: string | null; root_ts: string | null; oldest: string; latest: string; attempts: number };
-type ChannelRow = { workspace_id: string; workspace_name: string | null; channel_id: string; channel_name: string | null; enabled: boolean; message_count: string; last_observed_at: string | null };
+type ChannelRow = { workspace_id: string; workspace_name: string | null; channel_id: string; channel_name: string | null; conversation_type: string | null; enabled: boolean; message_count: string; last_observed_at: string | null };
 type JobRow = { id: string; kind: "initial" | "manual" | "downtime"; state: string; requested_start_at: string; requested_end_at: string; created_at: string; completed_at: string | null; last_error: string | null; channels: string; completed_tasks: string; total_tasks: string; history_tasks: string; reply_tasks: string };
 type SettingsRow = { slack_app_token: string | null; slack_user_token: string | null; slack_bot_token: string | null; mcp_auth_token: string | null; thread_settle_seconds: number; message_retention_days: number; raw_event_retention_days: number; backfill_request_interval_seconds: number; downtime_suggestion_seconds: number };
-function toStoredMessage(row: MessageRow): StoredMessage { return { eventId: row.event_id, eventSequence: Number(row.event_sequence), workspaceId: row.workspace_id, channelId: row.channel_id, messageTs: row.message_ts, threadTs: row.thread_ts, userId: row.user_id, subtype: row.subtype, text: row.text, payload: row.event_payload, observedAt: row.observed_at, workspaceName: row.workspace_name, channelName: row.channel_name }; }
+function toStoredMessage(row: MessageRow): StoredMessage { return { eventId: row.event_id, eventSequence: Number(row.event_sequence), workspaceId: row.workspace_id, channelId: row.channel_id, conversationType: conversationTypeFromStoredValue(row.conversation_type), messageTs: row.message_ts, threadTs: row.thread_ts, userId: row.user_id, subtype: row.subtype, text: row.text, payload: row.event_payload, observedAt: row.observed_at, workspaceName: row.workspace_name, channelName: row.channel_name }; }
 export function toConsumerProgress(row: { consumer_id: string; total_messages: string; acknowledged_messages: string; pending_messages: string; last_acknowledged_at: string | null }): ConsumerProgress { return { consumerId: row.consumer_id, totalMessages: Number(row.total_messages), acknowledgedMessages: Number(row.acknowledged_messages), pendingMessages: Number(row.pending_messages), lastAcknowledgedAt: row.last_acknowledged_at }; }
 function toTask(row: TaskRow): BackfillTask { return { id: Number(row.id), jobId: Number(row.job_id), workspaceId: row.workspace_id, channelId: row.channel_id, phase: row.phase, cursor: row.cursor, rootTs: row.root_ts, oldest: row.oldest, latest: row.latest, attempts: row.attempts }; }
 function toJob(row: JobRow): BackfillJob { return { id: Number(row.id), kind: row.kind, state: row.state, requestedStartAt: row.requested_start_at, requestedEndAt: row.requested_end_at, createdAt: row.created_at, completedAt: row.completed_at, channels: Number(row.channels), completedTasks: Number(row.completed_tasks), totalTasks: Number(row.total_tasks), historyTasks: Number(row.history_tasks), replyTasks: Number(row.reply_tasks), lastError: row.last_error }; }

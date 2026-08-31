@@ -1,8 +1,11 @@
+import type { ConversationType } from "./slack-conversation-type.js";
+
 export type StoredMessage = {
   eventId: string;
   eventSequence: number;
   workspaceId: string;
   channelId: string;
+  conversationType: ConversationType;
   messageTs: string;
   threadTs: string | null;
   userId: string | null;
@@ -32,6 +35,7 @@ export type DigestGroup = {
   workspaceName?: string | null;
   channelId: string;
   channelName?: string | null;
+  conversationType: ConversationType;
   messages: DigestMessage[];
   estimatedTokens: number;
   threadTs?: string;

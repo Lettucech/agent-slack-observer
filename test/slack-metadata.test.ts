@@ -9,7 +9,7 @@ test("enriches workspace and channel names without requesting Slack message hist
   globalThis.fetch = async (url) => {
     calls.push(String(url));
     if (String(url).endsWith("team.info")) return new Response(JSON.stringify({ ok: true, team: { name: "Engineering" } }));
-    return new Response(JSON.stringify({ ok: true, channel: { name: "agent-lab" } }));
+    return new Response(JSON.stringify({ ok: true, channel: { name: "agent-lab", is_channel: true } }));
   };
   try {
     const database = {
@@ -23,7 +23,7 @@ test("enriches workspace and channel names without requesting Slack message hist
     await new Promise((resolve) => setImmediate(resolve));
     await new Promise((resolve) => setImmediate(resolve));
     assert.deepEqual(calls, ["https://slack.com/api/team.info", "https://slack.com/api/conversations.info?channel=C1"]);
-    assert.deepEqual(saved, [["workspace", "T1", "Engineering"], ["channel", "T1", "C1", "agent-lab"]]);
+    assert.deepEqual(saved, [["workspace", "T1", "Engineering"], ["channel", "T1", "C1", "agent-lab", "public_channel"]]);
   } finally {
     globalThis.fetch = originalFetch;
   }

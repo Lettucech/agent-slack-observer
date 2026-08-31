@@ -61,7 +61,7 @@ export class ObserverRuntime {
     if (!this.metadata) throw new Error("Configure a Slack read token in Settings before syncing metadata");
     const channels = await this.database.listChannels();
     const covered = channels.filter((channel) => channel.enabled);
-    covered.forEach((channel) => this.metadata?.schedule(channel.workspaceId, channel.channelId, true));
+    covered.forEach((channel) => this.metadata?.schedule(channel.workspaceId, channel.channelId, true, true));
     return covered.length;
   }
   wakeBackfill(): void {

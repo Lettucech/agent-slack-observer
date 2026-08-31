@@ -62,6 +62,7 @@ function makeGroup(kind: DigestGroup["kind"], sourceMessages: StoredMessage[], t
     workspaceName: first.workspaceName,
     channelId: first.channelId,
     channelName: first.channelName,
+    conversationType: first.conversationType,
     messages: digestMessages,
     estimatedTokens: digestMessages.reduce((sum, message) => sum + estimateTokens(message), 0),
     ...(threadTs ? { threadTs } : {}),

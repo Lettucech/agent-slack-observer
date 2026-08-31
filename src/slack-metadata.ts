@@ -1,4 +1,6 @@
 import type { Database } from "./db.js";
+import { conversationTypeFromSlackChannel } from "./slack-conversation-type.js";
+import { SlackConversationNameResolver } from "./slack-conversation-name.js";
 
 const DEFAULT_RETRY_MS = 60_000;
 
@@ -9,23 +11,26 @@ const DEFAULT_RETRY_MS = 60_000;
 export class SlackMetadataSync {
   private readonly pending = new Set<string>();
   private readonly workspaceRequests = new Map<string, Promise<void>>();
+  private readonly displayNames: SlackConversationNameResolver;
   private retryNotBefore = 0;
 
-  constructor(private readonly readToken: string, private readonly database: Database) {}
+  constructor(private readonly readToken: string, private readonly database: Database) {
+    this.displayNames = new SlackConversationNameResolver((methodAndQuery) => this.slackGet(methodAndQuery));
+  }
 
-  schedule(workspaceId: string, channelId: string, force = false): void {
+  schedule(workspaceId: string, channelId: string, force = false, resolvePeople = false): void {
     const key = `${workspaceId}:${channelId}`;
     if (this.pending.has(key)) return;
     this.pending.add(key);
-    void this.sync(workspaceId, channelId, force).finally(() => this.pending.delete(key));
+    void this.sync(workspaceId, channelId, force, resolvePeople).finally(() => this.pending.delete(key));
   }
 
-  private async sync(workspaceId: string, channelId: string, force: boolean): Promise<void> {
+  private async sync(workspaceId: string, channelId: string, force: boolean, resolvePeople: boolean): Promise<void> {
     const due = force ? { workspace: true, channel: true } : await this.database.metadataLookupDue(workspaceId, channelId);
     if (!due.workspace && !due.channel) return;
     const delay = this.retryNotBefore - Date.now();
     if (delay > 0) {
-      setTimeout(() => this.schedule(workspaceId, channelId, force), delay);
+      setTimeout(() => this.schedule(workspaceId, channelId, force, resolvePeople), delay);
       return;
     }
     try {
@@ -33,14 +38,15 @@ export class SlackMetadataSync {
       if (due.channel) {
         const channel = await this.slackGet(`conversations.info?channel=${encodeURIComponent(channelId)}`);
         const name = getString(channel, "channel", "name");
-        // IMs have no Slack channel name. Keep their stable ID rather than fabricate a user name.
-        await this.database.saveChannelMetadata(workspaceId, channelId, name ?? channelId);
+        const details = isObject(channel.channel) ? channel.channel : {};
+        const displayName = resolvePeople ? await this.displayNames.resolve(details) : name ?? channelId;
+        await this.database.saveChannelMetadata(workspaceId, channelId, displayName ?? channelId, conversationTypeFromSlackChannel(details));
       }
     } catch (error) {
       const message = error instanceof Error ? error.message : "Slack metadata lookup failed";
       await this.database.saveMetadataError(workspaceId, channelId, message);
       const delay = this.retryNotBefore - Date.now();
-      if (delay > 0) setTimeout(() => this.schedule(workspaceId, channelId, force), delay);
+      if (delay > 0) setTimeout(() => this.schedule(workspaceId, channelId, force, resolvePeople), delay);
     }
   }
 

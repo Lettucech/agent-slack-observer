@@ -1,4 +1,7 @@
-export type UserVisibleConversation = { channelId: string; channelName: string | null };
+import { conversationTypeFromSlackChannel, type ConversationType } from "./slack-conversation-type.js";
+import { SlackConversationNameResolver } from "./slack-conversation-name.js";
+
+export type UserVisibleConversation = { channelId: string; channelName: string | null; conversationType: ConversationType };
 
 export type ConversationDiscoveryDatabase = {
   registerUserVisibleConversations(workspaceId: string, workspaceName: string | null, conversations: UserVisibleConversation[]): Promise<void>;
@@ -16,6 +19,7 @@ export class SlackConversationDiscovery {
     const workspaceId = stringValue(identity.team_id);
     if (!workspaceId) throw new Error("Slack auth.test returned no workspace ID");
     const conversations: UserVisibleConversation[] = [];
+    const displayNames = new SlackConversationNameResolver((methodAndQuery) => this.slackGet(methodAndQuery));
     let cursor: string | undefined;
     do {
       const parameters = new URLSearchParams({
@@ -29,7 +33,7 @@ export class SlackConversationDiscovery {
       for (const channel of channels) {
         if (!isObject(channel) || channel.is_archived === true) continue;
         const channelId = stringValue(channel.id);
-        if (channelId) conversations.push({ channelId, channelName: stringValue(channel.name) });
+        if (channelId) conversations.push({ channelId, channelName: await displayNames.resolve(channel), conversationType: conversationTypeFromSlackChannel(channel) });
       }
       cursor = isObject(page.response_metadata) ? nonEmptyString(page.response_metadata.next_cursor) : undefined;
     } while (cursor);
