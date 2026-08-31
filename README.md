@@ -16,6 +16,12 @@ The observer never uses Slack MCP or posts a reply. It can record a consumer's s
    docker compose up --build
    ```
 
+   To use a different local port without restoring an `.env` file:
+
+   ```sh
+   PORT=13000 docker compose up --build
+   ```
+
 2. Open `http://localhost:3000`. The dashboard starts even with no Slack credentials.
 
 3. In **Connection and retention settings**, enter the Slack App Token and choose either a User or Bot Token. The dashboard stores only that choice and removes the unselected read token when you save. Use **Test connection** before saving; it verifies Slack without writing settings or starting Socket Mode. Save to activate the observer immediately. The dashboard generates an MCP bearer token on the first save and displays it once.
