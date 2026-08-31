@@ -22,9 +22,9 @@ The observer never uses Slack MCP or posts a reply. It can record a consumer's s
    PORT=13000 docker compose up --build
    ```
 
-2. Open `http://localhost:3000`. The dashboard starts even with no Slack credentials.
+2. Open `http://localhost:3000`. Until setup is complete, Observer shows a dedicated onboarding flow rather than the dashboard.
 
-3. In **Connection and retention settings**, enter the Slack App Token and choose either a User or Bot Token. The dashboard stores only that choice and removes the unselected read token when you save. Use **Test connection** before saving; it verifies Slack without writing settings or starting Socket Mode. Save to activate the observer immediately. The dashboard generates an MCP bearer token on the first save and displays it once.
+3. Choose either a User or Bot Token, review its scopes, then enter the App Token and selected read token. The dashboard stores only that choice and removes the unselected read token when you save. Use **Test connection** before saving; it verifies Slack without writing settings or starting Socket Mode. Save to activate the observer immediately. The dashboard generates an MCP bearer token on the first save and displays it once.
 
 The MCP endpoint is `http://localhost:3000/mcp` and requires the Bearer token generated or rotated in the dashboard.
 
@@ -55,17 +55,15 @@ Company networks that allow outbound connections but block inbound public callba
 This service does **not** create or install the Slack app. Each user does that in Slack; bot-only operation also requires adding the installed bot to every channel it should observe.
 
 1. Create a Slack app, enable a bot user, and install it to the target workspace.
-2. Under **OAuth & Permissions**, add the minimal bot scopes for the bot-only setup, or the equivalent **user scopes** for user-visible observation:
-   - Public channels: `channels:history`
-   - Private channels (optional): `groups:history`
-   - Direct messages (optional): `im:history`
-   - Group direct messages (optional): `mpim:history`
-   - Workspace name: `team:read`
-   - Public channel name: `channels:read`
-   - Private/DM/MPIM names (only when those are observed): `groups:read`, `im:read`, `mpim:read`
+2. Under **OAuth & Permissions**, add scopes to the selected **user** or **bot** token only for the conversation types you intend to observe. The dashboard lists the complete scope checklist:
+   - Public channels: `channels:read`, `channels:history`
+   - Private channels (optional): `groups:read`, `groups:history`
+   - Direct messages (optional): `im:read`, `im:history`
+   - Group direct messages (optional): `mpim:read`, `mpim:history`
+   - Workspace metadata: `team:read`
 3. Under **Settings → Socket Mode**, enable Socket Mode. No Request URL is needed or allowed in this mode.
 4. Under **Settings → Basic Information → App-Level Tokens**, choose **Generate Token and Scopes**, give it a name, select `connections:write`, and paste the generated `xapp-…` value into the dashboard's **Slack App Token** field.
-5. Under **Event Subscriptions**, enable events. For bot-only operation, subscribe to the corresponding bot events: `message.channels` (and, only if required, `message.groups`, `message.im`, `message.mpim`). For user-visible observation, subscribe to the matching Workspace Events after the user has granted the corresponding user scopes. Slack filters those event deliveries to conversations the authorising user can see.
+5. Under **Event Subscriptions**, enable only matching events: `message.channels`, `message.groups`, `message.im`, and/or `message.mpim`. For bot-only operation, add the installed bot to every observed channel. For user-visible observation, subscribe to the matching Workspace Events after the user has granted the corresponding user scopes. Slack filters those event deliveries to conversations the authorising user can see.
 6. Reinstall or re-authorise after scope changes. For user-visible observation, paste the authorising user's `xoxp-…` token into **Slack User Token**; otherwise paste the app's `xoxb-…` token into **Slack Bot Token**.
 7. Test and save the dashboard settings. With a user token, use **Sync user-visible conversations** to register public channels, private channels, DMs, and group DMs that token can see. This is a deliberate local action, not a startup task. Without it, add quiet channels by workspace and channel ID before the first backfill. Socket Mode channels are registered automatically after their first event.
 

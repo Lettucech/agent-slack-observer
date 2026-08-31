@@ -1,184 +1,190 @@
-document.querySelector("#mcp-url").textContent = `${window.location.origin}/mcp`;
-
 const refreshIntervalSeconds = 15;
-const pageTitles = { overview: "Overview", operations: "Channels & backfill", agents: "Agents" };
+const pageTitles = new Set(["overview", "operations", "agents"]);
+const readScopes = ["channels:read", "channels:history", "groups:read", "groups:history", "im:read", "im:history", "mpim:read", "mpim:history", "team:read"];
+const eventNames = ["message.channels", "message.groups", "message.im", "message.mpim"];
+
+const $ = (selector) => document.querySelector(selector);
+const dashboard = $("#dashboard");
+const onboarding = $("#onboarding");
+const onboardingChoice = $("#onboarding-choice");
+const onboardingConfig = $("#onboarding-config");
+const onboardingSuccess = $("#onboarding-success");
+const onboardingForm = $("#onboarding-form");
+const onboardingStatus = $("#onboarding-status");
+const settingsLayer = $("#settings-layer");
+const settingsDrawer = $("#settings-drawer");
+const settingsForm = $("#settings-form");
+const settingsStatus = $("#settings-status");
+const settingsToggle = $("#settings-toggle");
+const confirmDialog = $("#confirm-dialog");
+const confirmCopy = $("#confirm-copy");
 const navButtons = [...document.querySelectorAll("[data-view]")];
 const viewPanels = [...document.querySelectorAll("[data-view-panel]")];
-const pageTitle = document.querySelector("#page-title");
-const refreshStatus = document.querySelector("#refresh-status");
-const metadataStatus = document.querySelector("#metadata-status");
-const backfillStatus = document.querySelector("#backfill-status");
-const syncNamesButton = document.querySelector("#sync-names");
-const initialBackfillButton = document.querySelector("#initial-backfill");
-const discoverConversationsButton = document.querySelector("#discover-conversations");
-const discoveryStatus = document.querySelector("#discovery-status");
-const settingsLayer = document.querySelector("#settings-layer");
-const settingsDrawer = document.querySelector("#settings-drawer");
-const settingsToggle = document.querySelector("#settings-toggle");
-const settingsForm = document.querySelector("#settings-form");
-const settingsStatus = document.querySelector("#settings-status");
-const settingsState = document.querySelector("#settings-state");
-const readTokenTypeInputs = [...settingsForm.querySelectorAll("input[name=slackReadTokenType]")];
-const userTokenField = document.querySelector("#slack-user-token-field");
-const botTokenField = document.querySelector("#slack-bot-token-field");
-const userTokenInput = settingsForm.elements.namedItem("slackUserToken");
-const botTokenInput = settingsForm.elements.namedItem("slackBotToken");
-const testSettingsButton = document.querySelector("#test-settings");
-const saveSettingsButton = settingsForm.querySelector("button[type=submit]");
-const rotateMcpTokenButton = document.querySelector("#rotate-mcp-token");
-const mcpTokenResult = document.querySelector("#mcp-token-result");
-const mcpToken = document.querySelector("#mcp-token");
-const setupNotice = document.querySelector("#setup-notice");
-const attentionDot = document.querySelector(".attention-dot");
-const headerSocketState = document.querySelector("#header-socket-state");
-const headerSocketDot = document.querySelector("#header-socket-dot");
-const confirmDialog = document.querySelector("#confirm-dialog");
-const confirmCopy = document.querySelector("#confirm-copy");
 let nextRefreshAt = Date.now();
 let refreshInFlight = false;
 let lastSettingsOpener = null;
-let setupPrompted = false;
+let onboardingTokenType = null;
 
-function renderRefreshStatus(message) { refreshStatus.textContent = message; }
-function resetCountdown() { nextRefreshAt = Date.now() + refreshIntervalSeconds * 1000; }
-function updateCountdown() { if (!refreshInFlight) renderRefreshStatus(`Auto-refresh in ${Math.max(0, Math.ceil((nextRefreshAt - Date.now()) / 1000))}s`); }
+$("#mcp-url").textContent = `${window.location.origin}/mcp`;
+
 function escapeHtml(value) { return String(value).replace(/[&<>'"]/g, (char) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", "'": "&#39;", '"': "&quot;" }[char])); }
 function formatReference(name, id) { return name && name !== id ? `<strong class="reference-name">${escapeHtml(name)}</strong><code>${escapeHtml(id)}</code>` : `<code>${escapeHtml(id)}</code>`; }
 function time(value) { return value ? new Date(value).toLocaleString() : "Never"; }
+function shortTime(value) { return value ? new Date(value).toLocaleString() : "None yet"; }
 function progressPercent(acknowledged, total) { return total ? Math.round((acknowledged / total) * 100) : 0; }
 function datetimeInput(date) { const offset = date.getTimezoneOffset() * 60_000; return new Date(date.getTime() - offset).toISOString().slice(0, 16); }
-function formValues() { return Object.fromEntries(new FormData(settingsForm)); }
-function showMcpToken(token) { mcpToken.textContent = token; mcpTokenResult.hidden = false; }
-function buttonBySelector(selector) { return document.querySelector(selector); }
-function setReadTokenType(type) {
-  const usingUserToken = type === "user";
-  userTokenField.hidden = !usingUserToken;
-  botTokenField.hidden = usingUserToken;
-  userTokenInput.disabled = !usingUserToken;
-  botTokenInput.disabled = usingUserToken;
+function resetCountdown() { nextRefreshAt = Date.now() + refreshIntervalSeconds * 1000; }
+function updateRefreshStatus() { if (!refreshInFlight) $("#refresh-status").textContent = `Updates in ${Math.max(0, Math.ceil((nextRefreshAt - Date.now()) / 1000))}s`; }
+function formValues(form) { return Object.fromEntries(new FormData(form)); }
+function setPending(button, pending, label) {
+  if (!button) return;
+  button.dataset.idleLabel ??= button.textContent;
+  button.disabled = pending;
+  button.classList.toggle("is-pending", pending);
+  button.setAttribute("aria-busy", String(pending));
+  button.textContent = pending ? label : button.dataset.idleLabel;
 }
 
-function setView(view, updateHash = true) {
-  if (!pageTitles[view]) return;
-  navButtons.forEach((button) => button.classList.toggle("is-active", button.dataset.view === view));
-  viewPanels.forEach((panel) => { const active = panel.dataset.viewPanel === view; panel.hidden = !active; panel.classList.toggle("is-active", active); });
-  pageTitle.textContent = pageTitles[view];
-  if (updateHash && window.location.hash !== `#${view}`) history.replaceState(null, "", `#${view}`);
+function tokenSummary(type) { return type === "user" ? "A User Token can explicitly discover public channels, private channels, DMs, and group DMs visible to the authorising user." : "A Bot Token is limited to conversations where the installed bot has access. It cannot run user-visible conversation discovery."; }
+function scopeGuide(type) {
+  const tokenLabel = type === "user" ? "User Token" : "Bot Token";
+  const access = type === "user" ? "Choose this when discovery should use the authorising user’s own Slack visibility." : "Add the installed bot to each channel it should observe.";
+  return `<h3>${tokenLabel} setup</h3><p>${access} Add <code>connections:write</code> to the App-Level Token, then add these OAuth scopes to the selected ${type} token.</p><ul>${readScopes.map((scope) => `<li><code>${scope}</code></li>`).join("")}</ul><p>Enable Socket Mode and subscribe to only the matching message events you intend to observe.</p><ul class="event-list">${eventNames.map((event) => `<li><code>${event}</code></li>`).join("")}</ul><p>Reinstall or re-authorise the app after changing scopes. Scope only the conversation types you actually need.</p>`;
 }
+function setSetupProgress(step) { document.querySelectorAll("[data-setup-step]").forEach((item) => item.classList.toggle("is-active", Number(item.dataset.setupStep) === step)); }
+function configureOnboardingToken(type) {
+  onboardingTokenType = type;
+  $("#onboarding-token-summary").textContent = tokenSummary(type);
+  $("#onboarding-scope-guide").innerHTML = scopeGuide(type);
+  onboardingForm.elements.namedItem("slackReadTokenType").value = type;
+  const usingUser = type === "user";
+  $("#onboarding-user-token-field").hidden = !usingUser;
+  $("#onboarding-bot-token-field").hidden = usingUser;
+  onboardingForm.elements.namedItem("slackUserToken").disabled = !usingUser;
+  onboardingForm.elements.namedItem("slackUserToken").required = usingUser;
+  onboardingForm.elements.namedItem("slackBotToken").disabled = usingUser;
+  onboardingForm.elements.namedItem("slackBotToken").required = !usingUser;
+  onboardingChoice.hidden = true;
+  onboardingConfig.hidden = false;
+  onboardingSuccess.hidden = true;
+  setSetupProgress(2);
+  onboardingForm.elements.namedItem(usingUser ? "slackUserToken" : "slackBotToken").focus();
+}
+function showOnboarding() { dashboard.hidden = true; onboarding.hidden = false; settingsLayer.hidden = true; document.body.classList.remove("drawer-open"); }
+function showDashboard() { onboarding.hidden = true; dashboard.hidden = false; }
 
-function openSettings(opener = settingsToggle) {
-  lastSettingsOpener = opener;
-  settingsLayer.hidden = false;
-  document.body.classList.add("drawer-open");
-  settingsToggle.setAttribute("aria-expanded", "true");
-  window.setTimeout(() => settingsDrawer.focus(), 0);
+function selectedSettingsTokenType() { return settingsForm.elements.namedItem("slackReadTokenType").value; }
+function setSettingsTokenType(type) {
+  const usingUser = type === "user";
+  [...settingsForm.querySelectorAll("input[name=slackReadTokenType]")].forEach((input) => { input.checked = input.value === type; });
+  $("#settings-scope-guide").innerHTML = scopeGuide(type);
+  $("#settings-user-token-field").hidden = !usingUser;
+  $("#settings-bot-token-field").hidden = usingUser;
+  settingsForm.elements.namedItem("slackUserToken").disabled = !usingUser;
+  settingsForm.elements.namedItem("slackBotToken").disabled = usingUser;
 }
-function closeSettings() {
-  settingsLayer.hidden = true;
-  document.body.classList.remove("drawer-open");
-  settingsToggle.setAttribute("aria-expanded", "false");
-  lastSettingsOpener?.focus();
-}
+function openSettings(opener = settingsToggle) { lastSettingsOpener = opener; settingsLayer.hidden = false; document.body.classList.add("drawer-open"); settingsToggle.setAttribute("aria-expanded", "true"); window.setTimeout(() => settingsDrawer.focus(), 0); }
+function closeSettings() { settingsLayer.hidden = true; document.body.classList.remove("drawer-open"); settingsToggle.setAttribute("aria-expanded", "false"); lastSettingsOpener?.focus(); }
 function socketLabel(socket) { return socket.state === "connected" ? "Connected" : socket.state === "not_configured" ? "Setup required" : socket.state === "reconnecting" ? "Reconnecting" : socket.state === "stopped" ? "Stopped" : "Connecting"; }
 function socketTone(socket) { return socket.state === "connected" ? "good" : socket.state === "not_configured" || socket.state === "stopped" ? "neutral" : socket.lastError ? "bad" : "warning"; }
+function setView(view, updateHash = true) { if (!pageTitles.has(view)) return; navButtons.forEach((button) => button.classList.toggle("is-active", button.dataset.view === view)); viewPanels.forEach((panel) => { const active = panel.dataset.viewPanel === view; panel.hidden = !active; panel.classList.toggle("is-active", active); }); if (updateHash && window.location.hash !== `#${view}`) history.replaceState(null, "", `#${view}`); }
+function compactRow(label, value) { return `<div class="compact-row"><strong>${escapeHtml(label)}</strong><span>${value}</span></div>`; }
 
 function renderSettings(settings) {
-  settingsState.textContent = settings.configured ? "Observer configured" : "Setup required";
-  settingsState.classList.toggle("incomplete", !settings.configured);
-  const numbers = ["threadSettleSeconds", "messageRetentionDays", "rawEventRetentionDays", "backfillRequestIntervalSeconds", "downtimeSuggestionSeconds"];
-  numbers.forEach((name) => { const field = settingsForm.elements.namedItem(name); if (field && document.activeElement !== field) field.value = settings[name]; });
-  const readTokenType = settings.slackUserTokenConfigured ? "user" : "bot";
-  readTokenTypeInputs.forEach((input) => { input.checked = input.value === readTokenType; });
-  setReadTokenType(readTokenType);
-  settingsStatus.textContent = settings.configured
-    ? `Saved locally. App Token and ${readTokenType === "user" ? "User" : "Bot"} Token are configured. Leave the selected secret blank to keep it.`
-    : "Add an App Token and choose one Slack read token. Test first; saving starts the observer and generates an MCP token.";
-  setupNotice.hidden = settings.configured;
-  attentionDot.hidden = settings.configured;
-  [syncNamesButton, initialBackfillButton, buttonBySelector("#target-form button"), buttonBySelector("#manual-backfill-form button")].forEach((button) => { button.disabled = !settings.configured; });
-  rotateMcpTokenButton.disabled = !settings.mcpAuthTokenConfigured;
-  if (!settings.configured && !setupPrompted) { setupPrompted = true; openSettings(settingsToggle); }
+  const numberFields = ["threadSettleSeconds", "messageRetentionDays", "rawEventRetentionDays", "backfillRequestIntervalSeconds", "downtimeSuggestionSeconds"];
+  numberFields.forEach((name) => { const field = settingsForm.elements.namedItem(name); if (document.activeElement !== field) field.value = settings[name]; });
+  setSettingsTokenType(settings.slackUserTokenConfigured ? "user" : "bot");
+  settingsStatus.textContent = "Saved tokens stay hidden. Leave the selected token empty to keep it unchanged.";
+  $("#rotate-mcp-token").disabled = !settings.mcpAuthTokenConfigured;
 }
 
-function renderOverview(status, socket) {
+function renderOverview(status, socket, channels, jobs) {
   const tone = socketTone(socket);
-  headerSocketState.textContent = socketLabel(socket);
-  headerSocketDot.className = `state-dot ${tone}`;
-  document.querySelector("#overview-socket-state").textContent = socketLabel(socket);
-  document.querySelector("#overview-socket-state").className = `socket-value ${tone}`;
-  document.querySelector("#overview-socket-detail").textContent = socket.lastError ?? (socket.lastEventAt ? `Last event ${time(socket.lastEventAt)}` : socket.state === "not_configured" ? "Add Slack credentials in Settings" : "Waiting for the first Slack event");
-  document.querySelector("#overview-summary").textContent = status.settings.configured
-    ? `${status.channels} active target${status.channels === 1 ? "" : "s"}; ${status.messages} normalized message${status.messages === 1 ? "" : "s"} available to connected agents.`
-    : "This local observer is ready for configuration. It will not contact Slack until you save valid credentials.";
-  const context = status.earliestMessageAt ? `Since ${time(status.earliestMessageAt)}` : "No message context yet";
-  document.querySelector("#overview-context").textContent = context;
-  document.querySelector("#overview-context-copy").textContent = status.earliestMessageAt
-    ? `Messages are retained according to the window in Settings. The earliest available context is ${time(status.earliestMessageAt)}.`
-    : "Once Socket Mode receives events or you run a backfill, local context will appear here.";
+  $("#header-socket-state").textContent = socketLabel(socket);
+  $("#header-socket-dot").className = `state-dot ${tone}`;
+  $("#overview-summary").textContent = `${status.channels} target${status.channels === 1 ? "" : "s"} · ${status.messages} messages available locally · last received ${shortTime(status.lastReceivedAt)}`;
+  const activeJobs = jobs.filter((job) => ["queued", "running"].includes(job.state));
+  const pendingMessages = status.consumers.reduce((sum, consumer) => sum + consumer.pendingMessages, 0);
+  $("#overview-health").innerHTML = [
+    ["Socket Mode", socketLabel(socket), socket.lastError ?? (socket.lastEventAt ? `Last event ${shortTime(socket.lastEventAt)}` : "Awaiting the first event"), tone],
+    ["Local data", `${status.messages} messages`, `${status.events} raw events · since ${shortTime(status.earliestMessageAt)}`, ""],
+    ["Backfill queue", activeJobs.length ? `${activeJobs.length} active` : "Idle", status.nextBackfillRequestAt ? `Next request ${shortTime(status.nextBackfillRequestAt)}` : "No scheduled Slack request", ""],
+    ["Agent delivery", `${status.consumers.length} agent${status.consumers.length === 1 ? "" : "s"}`, `${pendingMessages} pending acknowledgement${pendingMessages === 1 ? "" : "s"}`, ""],
+  ].map(([label, value, detail, toneClass]) => `<article class="health-card"><span>${label}</span><strong class="socket-value ${toneClass}">${escapeHtml(value)}</strong><small>${escapeHtml(detail)}</small></article>`).join("");
+  $("#overview-channels").innerHTML = channels.length ? channels.slice(0, 3).map((channel) => compactRow(channel.channelName ?? channel.channelId, `${channel.messageCount} messages · ${shortTime(channel.lastObservedAt)}`)).join("") : "<p>No channels are registered yet.</p>";
+  $("#overview-backfill").innerHTML = jobs.length ? jobs.slice(0, 3).map((job) => compactRow(`#${job.id} ${job.kind}`, `${job.completedTasks}/${job.totalTasks} tasks · ${job.state}`)).join("") : "<p>No backfill jobs yet.</p>";
+  $("#overview-agents").innerHTML = status.consumers.length ? status.consumers.slice(0, 3).map((consumer) => compactRow(consumer.consumerId, `${consumer.pendingMessages} pending · ${progressPercent(consumer.acknowledgedMessages, consumer.totalMessages)}% delivered`)).join("") : "<p>No agent acknowledgements yet.</p>";
+}
+
+function renderDashboardData(status, channels, jobs, suggestions) {
+  const socket = status.socketMode;
+  renderSettings(status.settings);
+  renderOverview(status, socket, channels, jobs);
+  $("#discover-conversations").disabled = !status.userTokenConfigured;
+  $("#discovery-status").textContent = status.userTokenConfigured ? "" : "Choose a User Token in Settings to enable discovery.";
+  $("#channels").innerHTML = channels.length ? channels.map((channel) => `<tr><td>${formatReference(channel.workspaceName, channel.workspaceId)}</td><td>${formatReference(channel.channelName, channel.channelId)}</td><td>${channel.messageCount}</td><td>${time(channel.lastObservedAt)}</td></tr>`).join("") : "<tr><td colspan=\"4\" class=\"form-status\">No channels are registered yet.</td></tr>";
+  $("#consumer-progress").innerHTML = status.consumers.length ? status.consumers.map((consumer) => { const progress = progressPercent(consumer.acknowledgedMessages, consumer.totalMessages); return `<tr><td><code>${escapeHtml(consumer.consumerId)}</code></td><td>${consumer.acknowledgedMessages} / ${consumer.totalMessages}</td><td>${consumer.pendingMessages}</td><td><div class=\"progress\" aria-label=\"${progress}% consumed\"><span style=\"width:${progress}%\"></span></div><small>${progress}%</small></td><td>${time(consumer.lastAcknowledgedAt)}</td></tr>`; }).join("") : "<tr><td colspan=\"5\" class=\"form-status\">No agent acknowledgement yet.</td></tr>";
+  $("#backfill-jobs").innerHTML = jobs.length ? jobs.map((job) => `<tr><td>#${job.id} · ${escapeHtml(job.kind)}</td><td>${time(job.requestedStartAt)}<br>to ${time(job.requestedEndAt)}</td><td>${job.completedTasks}/${job.totalTasks} tasks<br><small>${job.channels} channels · ${job.replyTasks} reply checks</small></td><td>${escapeHtml(job.state)}</td><td>${job.lastError ? `<span class=\"error\">${escapeHtml(job.lastError)}</span>` : ""}${["queued", "running"].includes(job.state) ? `<button class=\"secondary tiny\" data-cancel-job=\"${job.id}\" type=\"button\">Cancel</button>` : ""}</td></tr>`).join("") : "<tr><td colspan=\"5\" class=\"form-status\">No backfill jobs yet.</td></tr>";
+  $("#backfill-suggestions").innerHTML = suggestions.length ? `<div class="suggestions"><strong>Possible Socket Mode gaps</strong>${suggestions.map((item) => `<p>${time(item.startAt)} to ${time(item.endAt)} <button class="secondary tiny" data-accept-suggestion="${item.id}" type="button">Queue fetch</button><button class="secondary tiny" data-dismiss-suggestion="${item.id}" type="button">Dismiss</button></p>`).join("")}</div>` : "";
+  $("#backfill-status").textContent = status.nextBackfillRequestAt && new Date(status.nextBackfillRequestAt) > new Date() ? `Next Slack request: ${time(status.nextBackfillRequestAt)}.` : "Queue is ready for its next Slack request.";
 }
 
 async function loadDashboard() {
   if (refreshInFlight) return;
   refreshInFlight = true;
-  renderRefreshStatus("Refreshing observer data…");
-  const [statusResponse, channelsResponse, backfillResponse] = await Promise.all([fetch("/dashboard/status"), fetch("/dashboard/channels"), fetch("/dashboard/backfill")]);
-  if (!statusResponse.ok || !channelsResponse.ok || !backfillResponse.ok) throw new Error("Dashboard endpoints are unavailable.");
-  const [status, { channels }, { jobs, suggestions }] = await Promise.all([statusResponse.json(), channelsResponse.json(), backfillResponse.json()]);
-  const socket = status.socketMode;
-  renderSettings(status.settings);
-  renderOverview(status, socket);
-  discoverConversationsButton.disabled = !status.settings.configured || !status.userTokenConfigured;
-  discoveryStatus.textContent = !status.userTokenConfigured ? "Configure a Slack user token in Settings to enable this action." : "";
-  document.querySelector("#stats").innerHTML = [["Slack socket", socketLabel(socket)], ["Stored raw events", status.events], ["Messages", status.messages], ["Targets", status.channels], ["Earliest context", status.earliestMessageAt ? time(status.earliestMessageAt) : "None"]].map(([label, value]) => `<article class="stat"><span>${label}</span><strong>${escapeHtml(value)}</strong></article>`).join("");
-  document.querySelector("#consumer-progress").innerHTML = status.consumers.length ? status.consumers.map((consumer) => { const progress = progressPercent(consumer.acknowledgedMessages, consumer.totalMessages); return `<tr><td><code>${escapeHtml(consumer.consumerId)}</code></td><td>${consumer.acknowledgedMessages} / ${consumer.totalMessages}</td><td>${consumer.pendingMessages}</td><td><div class="progress" aria-label="${progress}% consumed"><span style="width:${progress}%"></span></div><small>${progress}%</small></td><td>${time(consumer.lastAcknowledgedAt)}</td></tr>`; }).join("") : "<tr><td colspan=\"5\" class=\"muted\">No agent acknowledgement yet.</td></tr>";
-  document.querySelector("#channels").innerHTML = channels.length ? channels.map((channel) => `<tr><td>${formatReference(channel.workspaceName, channel.workspaceId)}</td><td>${formatReference(channel.channelName, channel.channelId)}</td><td>${channel.messageCount}</td><td>${time(channel.lastObservedAt)}</td></tr>`).join("") : "<tr><td colspan=\"4\" class=\"muted\">No target channels yet.</td></tr>";
-  document.querySelector("#backfill-jobs").innerHTML = jobs.length ? jobs.map((job) => `<tr><td>#${job.id} · ${escapeHtml(job.kind)}</td><td>${time(job.requestedStartAt)}<br>to ${time(job.requestedEndAt)}</td><td>${job.completedTasks}/${job.totalTasks} tasks<br><small>${job.channels} channels · ${job.replyTasks} reply checks</small></td><td>${escapeHtml(job.state)}</td><td>${job.lastError ? `<span class=\"error\">${escapeHtml(job.lastError)}</span>` : ""}${["queued", "running"].includes(job.state) ? `<button class=\"secondary tiny\" data-cancel-job=\"${job.id}\">Cancel</button>` : ""}</td></tr>`).join("") : "<tr><td colspan=\"5\" class=\"muted\">No backfill jobs yet.</td></tr>";
-  document.querySelector("#backfill-suggestions").innerHTML = suggestions.length ? `<div class="suggestions"><strong>Possible Socket Mode gaps</strong>${suggestions.map((item) => `<p>${time(item.startAt)} to ${time(item.endAt)} <button class="secondary tiny" data-accept-suggestion="${item.id}">Queue fetch</button><button class="secondary tiny" data-dismiss-suggestion="${item.id}">Dismiss</button></p>`).join("")}</div>` : "";
-  backfillStatus.textContent = status.nextBackfillRequestAt && new Date(status.nextBackfillRequestAt) > new Date() ? `Next Slack history/thread request: ${time(status.nextBackfillRequestAt)}.` : "Queue is ready for its next Slack request.";
-  refreshInFlight = false;
-  resetCountdown();
-  updateCountdown();
+  setPending($("#refresh"), true, "Refreshing");
+  $("#refresh-status").textContent = "Refreshing…";
+  try {
+    const [statusResponse, channelsResponse, backfillResponse] = await Promise.all([fetch("/dashboard/status"), fetch("/dashboard/channels"), fetch("/dashboard/backfill")]);
+    if (!statusResponse.ok || !channelsResponse.ok || !backfillResponse.ok) throw new Error("Dashboard endpoints are unavailable.");
+    const [status, { channels }, { jobs, suggestions }] = await Promise.all([statusResponse.json(), channelsResponse.json(), backfillResponse.json()]);
+    if (!status.settings.configured) { showOnboarding(); return status; }
+    showDashboard();
+    renderDashboardData(status, channels, jobs, suggestions);
+    resetCountdown();
+    updateRefreshStatus();
+    return status;
+  } catch (error) {
+    resetCountdown();
+    $("#refresh-status").textContent = "Refresh failed";
+    console.error(error);
+    throw error;
+  } finally {
+    refreshInFlight = false;
+    setPending($("#refresh"), false);
+  }
 }
+async function refreshDashboard() { try { await loadDashboard(); } catch { /* Status is already visible in the top bar. */ } }
+async function post(url, body) { const response = await fetch(url, { method: "POST", headers: body ? { "Content-Type": "application/json" } : undefined, body: body ? JSON.stringify(body) : undefined }); if (!response.ok) throw new Error(await response.text()); return response.status === 204 ? undefined : response.json(); }
+function confirmAction(message, confirmLabel = "Continue") { confirmCopy.textContent = message; $("#confirm-action").textContent = confirmLabel; confirmDialog.showModal(); return new Promise((resolve) => confirmDialog.addEventListener("close", () => resolve(confirmDialog.returnValue === "confirm"), { once: true })); }
 
-async function refreshDashboard() {
-  try { await loadDashboard(); }
-  catch (cause) { refreshInFlight = false; resetCountdown(); renderRefreshStatus(`Refresh failed; retrying in ${refreshIntervalSeconds}s`); console.error(cause); }
-}
-async function post(url, body) {
-  const response = await fetch(url, { method: "POST", headers: body ? { "Content-Type": "application/json" } : undefined, body: body ? JSON.stringify(body) : undefined });
-  if (!response.ok) throw new Error(await response.text());
-  return response.status === 204 ? undefined : response.json();
-}
-function confirmAction(message, confirmLabel = "Continue") {
-  confirmCopy.textContent = message;
-  document.querySelector("#confirm-action").textContent = confirmLabel;
-  confirmDialog.showModal();
-  return new Promise((resolve) => { confirmDialog.addEventListener("close", () => resolve(confirmDialog.returnValue === "confirm"), { once: true }); });
-}
+document.querySelectorAll("[data-onboarding-token]").forEach((button) => button.addEventListener("click", () => configureOnboardingToken(button.dataset.onboardingToken)));
+$("#change-token-type").addEventListener("click", () => { onboardingConfig.hidden = true; onboardingChoice.hidden = false; setSetupProgress(1); });
+$("#onboarding-test").addEventListener("click", async () => { const button = $("#onboarding-test"); setPending(button, true, "Testing connection"); onboardingStatus.textContent = "Checking Slack without saving settings or starting Observer…"; try { await post("/dashboard/settings/test", formValues(onboardingForm)); onboardingStatus.textContent = "Connection verified. Save to start Observer."; } catch (error) { onboardingStatus.textContent = "Connection test failed. Check the tokens and scopes above."; console.error(error); } finally { setPending(button, false); } });
+onboardingForm.addEventListener("submit", async (event) => { event.preventDefault(); const button = $("#onboarding-save"); setPending(button, true, "Starting Observer"); onboardingStatus.textContent = "Saving local settings and starting Observer…"; try { const result = await post("/dashboard/settings", formValues(onboardingForm)); onboardingForm.querySelectorAll("input[type=password]").forEach((input) => { input.value = ""; }); $("#onboarding-mcp-token").textContent = result.mcpAuthToken ?? "Token was already generated. Open Settings to rotate it if needed."; onboardingConfig.hidden = true; onboardingSuccess.hidden = false; setSetupProgress(3); } catch (error) { onboardingStatus.textContent = "Settings could not be saved. Check the required tokens."; console.error(error); } finally { setPending(button, false); } });
+$("#enter-dashboard").addEventListener("click", async () => { showDashboard(); await refreshDashboard(); });
 
 navButtons.forEach((button) => button.addEventListener("click", () => setView(button.dataset.view)));
 document.querySelectorAll(".jump-button").forEach((button) => button.addEventListener("click", () => setView(button.dataset.jump)));
+$("#refresh").addEventListener("click", refreshDashboard);
 settingsToggle.addEventListener("click", () => openSettings(settingsToggle));
-document.querySelector("#settings-close").addEventListener("click", closeSettings);
-document.querySelector("[data-close-settings]").addEventListener("click", closeSettings);
-document.querySelector("#open-setup").addEventListener("click", () => openSettings(document.querySelector("#open-setup")));
-document.querySelector("#refresh").addEventListener("click", refreshDashboard);
-document.querySelector("#copy-mcp-url").addEventListener("click", async () => { try { await navigator.clipboard.writeText(`${window.location.origin}/mcp`); document.querySelector("#endpoint-status").textContent = "MCP endpoint copied."; } catch { document.querySelector("#endpoint-status").textContent = "Copy unavailable; select the endpoint above."; } });
-readTokenTypeInputs.forEach((input) => input.addEventListener("change", () => { if (input.checked) setReadTokenType(input.value); }));
-
-testSettingsButton.addEventListener("click", async () => { testSettingsButton.disabled = true; settingsStatus.textContent = "Testing Slack credentials without saving or starting the observer…"; try { await post("/dashboard/settings/test", formValues()); settingsStatus.textContent = "Slack credentials are valid. Save to start observing."; } catch (cause) { settingsStatus.textContent = "Connection test failed. Check the tokens and Slack app scopes."; console.error(cause); } finally { testSettingsButton.disabled = false; } });
-settingsForm.addEventListener("submit", async (event) => { event.preventDefault(); saveSettingsButton.disabled = true; settingsStatus.textContent = "Saving settings and starting observer services…"; try { const result = await post("/dashboard/settings", formValues()); if (result.mcpAuthToken) showMcpToken(result.mcpAuthToken); settingsForm.querySelectorAll("input[type=password]").forEach((field) => { field.value = ""; }); settingsStatus.textContent = "Settings saved. Observer services now use the new configuration."; await refreshDashboard(); } catch (cause) { settingsStatus.textContent = "Settings could not be saved. Check the required values."; console.error(cause); } finally { saveSettingsButton.disabled = false; } });
-rotateMcpTokenButton.addEventListener("click", async () => { if (!await confirmAction("This immediately invalidates MCP credentials used by connected agents. You will need to update every agent.", "Rotate token")) return; rotateMcpTokenButton.disabled = true; try { const result = await post("/dashboard/settings/mcp-token"); showMcpToken(result.mcpAuthToken); settingsStatus.textContent = "MCP token rotated. Update connected agents now."; await refreshDashboard(); } catch (cause) { settingsStatus.textContent = "MCP token could not be rotated."; console.error(cause); } finally { rotateMcpTokenButton.disabled = false; } });
-syncNamesButton.addEventListener("click", async () => { syncNamesButton.disabled = true; metadataStatus.textContent = "Queueing name lookup…"; try { const { queued } = await post("/dashboard/metadata/sync"); metadataStatus.textContent = queued ? `Name lookup queued for ${queued} channel${queued === 1 ? "" : "s"}.` : "No observed channels to synchronize."; await refreshDashboard(); } catch (cause) { metadataStatus.textContent = "Name synchronization could not be queued."; console.error(cause); } finally { syncNamesButton.disabled = false; } });
-discoverConversationsButton.addEventListener("click", async () => { discoverConversationsButton.disabled = true; discoveryStatus.textContent = "Reading the user-visible conversation list…"; try { const { conversations } = await post("/dashboard/conversations/discover"); discoveryStatus.textContent = `${conversations} user-visible conversation${conversations === 1 ? "" : "s"} registered. Use the index action to fetch history.`; await refreshDashboard(); } catch (cause) { discoveryStatus.textContent = "User-visible conversations could not be synchronized."; console.error(cause); } finally { discoverConversationsButton.disabled = false; } });
-document.querySelector("#target-form").addEventListener("submit", async (event) => { event.preventDefault(); const form = event.currentTarget; const button = form.querySelector("button"); button.disabled = true; try { await post("/dashboard/targets", { workspaceId: document.querySelector("#target-workspace").value, channelId: document.querySelector("#target-channel").value }); form.reset(); await refreshDashboard(); } catch (cause) { metadataStatus.textContent = "Channel could not be added."; console.error(cause); } finally { button.disabled = false; } });
-initialBackfillButton.addEventListener("click", async () => { initialBackfillButton.disabled = true; backfillStatus.textContent = "Creating complete thread index job…"; try { await post("/dashboard/backfill/initial"); await refreshDashboard(); } catch (cause) { backfillStatus.textContent = "Initial index could not be queued."; console.error(cause); } finally { initialBackfillButton.disabled = false; } });
-document.querySelector("#manual-backfill-form").addEventListener("submit", async (event) => { event.preventDefault(); const form = event.currentTarget; const button = form.querySelector("button"); button.disabled = true; try { await post("/dashboard/backfill/manual", { startAt: new Date(document.querySelector("#backfill-start").value).toISOString(), endAt: new Date(document.querySelector("#backfill-end").value).toISOString() }); await refreshDashboard(); } catch (cause) { backfillStatus.textContent = "Backfill window could not be queued."; console.error(cause); } finally { button.disabled = false; } });
-document.addEventListener("click", async (event) => { const target = event.target; if (!(target instanceof HTMLButtonElement)) return; try { if (target.dataset.cancelJob && await confirmAction("Cancel this backfill job? Completed work stays stored locally.", "Cancel job")) await post(`/dashboard/backfill/${target.dataset.cancelJob}/cancel`); if (target.dataset.acceptSuggestion) await post(`/dashboard/backfill/suggestions/${target.dataset.acceptSuggestion}/accept`); if (target.dataset.dismissSuggestion) await post(`/dashboard/backfill/suggestions/${target.dataset.dismissSuggestion}/dismiss`); if (target.dataset.cancelJob || target.dataset.acceptSuggestion || target.dataset.dismissSuggestion) await refreshDashboard(); } catch (cause) { backfillStatus.textContent = "Backfill action could not be completed."; console.error(cause); } });
+$("#settings-close").addEventListener("click", closeSettings);
+$("[data-close-settings]").addEventListener("click", closeSettings);
+settingsForm.querySelectorAll("input[name=slackReadTokenType]").forEach((input) => input.addEventListener("change", () => setSettingsTokenType(input.value)));
+$("#test-settings").addEventListener("click", async () => { const button = $("#test-settings"); setPending(button, true, "Testing connection"); settingsStatus.textContent = "Checking Slack without saving settings or restarting Observer…"; try { await post("/dashboard/settings/test", formValues(settingsForm)); settingsStatus.textContent = "Connection verified. Save changes when ready."; } catch (error) { settingsStatus.textContent = "Connection test failed. Check the selected token and scopes."; console.error(error); } finally { setPending(button, false); } });
+settingsForm.addEventListener("submit", async (event) => { event.preventDefault(); const button = $("#save-settings"); setPending(button, true, "Saving changes"); settingsStatus.textContent = "Applying local settings and restarting affected services…"; try { const result = await post("/dashboard/settings", formValues(settingsForm)); if (result.mcpAuthToken) { $("#mcp-token").textContent = result.mcpAuthToken; $("#mcp-token-result").hidden = false; } settingsForm.querySelectorAll("input[type=password]").forEach((input) => { input.value = ""; }); settingsStatus.textContent = "Settings saved."; await refreshDashboard(); } catch (error) { settingsStatus.textContent = "Settings could not be saved. Check the required tokens."; console.error(error); } finally { setPending(button, false); } });
+$("#rotate-mcp-token").addEventListener("click", async () => { if (!await confirmAction("This immediately invalidates MCP credentials used by connected agents. You will need to update every agent.", "Rotate token")) return; const button = $("#rotate-mcp-token"); setPending(button, true, "Rotating token"); try { const result = await post("/dashboard/settings/mcp-token"); $("#mcp-token").textContent = result.mcpAuthToken; $("#mcp-token-result").hidden = false; settingsStatus.textContent = "MCP token rotated. Update connected agents now."; } catch (error) { settingsStatus.textContent = "MCP token could not be rotated."; console.error(error); } finally { setPending(button, false); } });
+$("#copy-mcp-url").addEventListener("click", async () => { const button = $("#copy-mcp-url"); setPending(button, true, "Copying"); try { await navigator.clipboard.writeText(`${window.location.origin}/mcp`); $("#endpoint-status").textContent = "MCP endpoint copied."; } catch { $("#endpoint-status").textContent = "Copy unavailable; select the endpoint above."; } finally { setPending(button, false); } });
+$("#sync-names").addEventListener("click", async () => { const button = $("#sync-names"); setPending(button, true, "Syncing names"); $("#metadata-status").textContent = "Queueing name lookup…"; try { const { queued } = await post("/dashboard/metadata/sync"); $("#metadata-status").textContent = queued ? `Name lookup queued for ${queued} channel${queued === 1 ? "" : "s"}.` : "No channels need a name lookup."; await refreshDashboard(); } catch (error) { $("#metadata-status").textContent = "Name synchronization could not be queued."; console.error(error); } finally { setPending(button, false); } });
+$("#discover-conversations").addEventListener("click", async () => { const button = $("#discover-conversations"); setPending(button, true, "Syncing conversations"); $("#discovery-status").textContent = "Reading visible conversations…"; try { const { conversations } = await post("/dashboard/conversations/discover"); $("#discovery-status").textContent = `${conversations} visible conversation${conversations === 1 ? "" : "s"} registered.`; await refreshDashboard(); } catch (error) { $("#discovery-status").textContent = "Visible conversations could not be synchronized."; console.error(error); } finally { setPending(button, false); } });
+$("#target-form").addEventListener("submit", async (event) => { event.preventDefault(); const form = event.currentTarget; const button = form.querySelector("button"); setPending(button, true, "Adding channel"); try { await post("/dashboard/targets", { workspaceId: $("#target-workspace").value, channelId: $("#target-channel").value }); form.reset(); $("#metadata-status").textContent = "Channel added."; await refreshDashboard(); } catch (error) { $("#metadata-status").textContent = "Channel could not be added."; console.error(error); } finally { setPending(button, false); } });
+$("#initial-backfill").addEventListener("click", async () => { const button = $("#initial-backfill"); setPending(button, true, "Creating index"); $("#backfill-status").textContent = "Creating history and thread index job…"; try { await post("/dashboard/backfill/initial"); await refreshDashboard(); } catch (error) { $("#backfill-status").textContent = "Index job could not be queued."; console.error(error); } finally { setPending(button, false); } });
+$("#manual-backfill-form").addEventListener("submit", async (event) => { event.preventDefault(); const form = event.currentTarget; const button = form.querySelector("button"); setPending(button, true, "Queueing fetch"); $("#backfill-status").textContent = "Queueing selected time range…"; try { await post("/dashboard/backfill/manual", { startAt: new Date($("#backfill-start").value).toISOString(), endAt: new Date($("#backfill-end").value).toISOString() }); await refreshDashboard(); } catch (error) { $("#backfill-status").textContent = "Time range could not be queued."; console.error(error); } finally { setPending(button, false); } });
+document.addEventListener("click", async (event) => { const button = event.target; if (!(button instanceof HTMLButtonElement)) return; let action; if (button.dataset.cancelJob) action = async () => { if (await confirmAction("Cancel this backfill job? Completed work stays stored locally.", "Cancel job")) await post(`/dashboard/backfill/${button.dataset.cancelJob}/cancel`); }; if (button.dataset.acceptSuggestion) action = () => post(`/dashboard/backfill/suggestions/${button.dataset.acceptSuggestion}/accept`); if (button.dataset.dismissSuggestion) action = () => post(`/dashboard/backfill/suggestions/${button.dataset.dismissSuggestion}/dismiss`); if (!action) return; setPending(button, true, button.dataset.cancelJob ? "Cancelling" : button.dataset.acceptSuggestion ? "Queueing" : "Dismissing"); try { await action(); await refreshDashboard(); } catch (error) { $("#backfill-status").textContent = "Backfill action could not be completed."; console.error(error); } finally { setPending(button, false); } });
 document.addEventListener("keydown", (event) => { if (event.key === "Escape" && !settingsLayer.hidden) closeSettings(); });
 window.addEventListener("hashchange", () => setView(window.location.hash.slice(1), false));
-document.querySelector("#backfill-start").value = datetimeInput(new Date(Date.now() - 24 * 60 * 60 * 1000));
-document.querySelector("#backfill-end").value = datetimeInput(new Date());
+$("#backfill-start").value = datetimeInput(new Date(Date.now() - 24 * 60 * 60 * 1000));
+$("#backfill-end").value = datetimeInput(new Date());
 setView(window.location.hash.slice(1) || "overview", false);
-setInterval(() => { updateCountdown(); if (!refreshInFlight && Date.now() >= nextRefreshAt) void refreshDashboard(); }, 1000);
-void refreshDashboard();
+setInterval(() => { updateRefreshStatus(); if (!refreshInFlight && !dashboard.hidden && Date.now() >= nextRefreshAt) void refreshDashboard(); }, 1000);
+void loadDashboard();
