@@ -1,7 +1,7 @@
 import type { DigestBatch, DigestGroup, DigestMessage, StoredMessage } from "./types.js";
 
 type DigestOptions = {
-  maxTokens: number;
+  maxBytes: number;
   channelWindowSeconds?: number;
 };
 
@@ -11,18 +11,15 @@ type GroupedMessages = {
   threadTs?: string;
 };
 
-function estimateTokens(message: DigestMessage): number {
-  // Count the exact projected JSON bytes instead of capping an unreturned approximation.
-  // This intentionally overestimates ordinary text tokens, keeping budgets safe for CJK and JSON.
-  return Math.max(24, Buffer.byteLength(JSON.stringify(message), "utf8"));
+function bytes(value: unknown): number {
+  return Buffer.byteLength(JSON.stringify(value), "utf8");
 }
 
 function projectMessage(message: StoredMessage, text = message.text, textContinues?: number): DigestMessage {
   return {
-    eventId: message.eventId,
     messageTs: message.messageTs,
-    userId: message.userId,
-    subtype: message.subtype,
+    ...(message.userId ? { userId: message.userId } : {}),
+    ...(message.subtype ? { subtype: message.subtype } : {}),
     text,
     ...(textContinues === undefined ? {} : { textContinues }),
   };
@@ -30,20 +27,20 @@ function projectMessage(message: StoredMessage, text = message.text, textContinu
 
 /** Return the next lossless text segment that fits the caller's budget. */
 export function makeMessageDigestSegment(message: StoredMessage, maxTokens: number, afterTextOffset = 0): DigestMessage {
-  if (!Number.isInteger(maxTokens) || maxTokens < 128) throw new Error("maxTokens must be at least 128");
+  if (!Number.isInteger(maxTokens) || maxTokens < 128) throw new Error("maxBytes must be at least 128");
   if (!Number.isInteger(afterTextOffset) || afterTextOffset < 0) throw new Error("afterTextOffset must be a non-negative integer");
   const characters = Array.from(message.text ?? "");
   if (afterTextOffset > characters.length) throw new Error("afterTextOffset is beyond the message text");
 
   const full = projectMessage(message, characters.slice(afterTextOffset).join(""));
-  if (estimateTokens(full) <= maxTokens || !message.text) return full;
+  if (bytes(full) <= maxTokens || !message.text) return full;
 
   let low = afterTextOffset;
   let high = characters.length;
   while (low < high) {
     const middle = Math.ceil((low + high) / 2);
     const candidate = projectMessage(message, characters.slice(afterTextOffset, middle).join(""), middle);
-    if (estimateTokens(candidate) <= maxTokens) low = middle;
+    if (bytes(candidate) <= maxTokens) low = middle;
     else high = middle - 1;
   }
   return projectMessage(message, characters.slice(afterTextOffset, low).join(""), low);
@@ -56,7 +53,6 @@ function messageTime(message: StoredMessage): number {
 function makeGroup(kind: DigestGroup["kind"], sourceMessages: StoredMessage[], threadTs?: string, digestMessages = sourceMessages.map((message) => projectMessage(message))): DigestGroup {
   const first = sourceMessages[0];
   return {
-    id: threadTs ? `${first.workspaceId}:${first.channelId}:${threadTs}` : `${first.workspaceId}:${first.channelId}:${first.eventSequence}`,
     kind,
     workspaceId: first.workspaceId,
     workspaceName: first.workspaceName,
@@ -64,9 +60,7 @@ function makeGroup(kind: DigestGroup["kind"], sourceMessages: StoredMessage[], t
     channelName: first.channelName,
     conversationType: first.conversationType,
     messages: digestMessages,
-    estimatedTokens: digestMessages.reduce((sum, message) => sum + estimateTokens(message), 0),
     ...(threadTs ? { threadTs } : {}),
-    threadContinues: false,
   };
 }
 
@@ -120,37 +114,36 @@ function groupMessages(messages: StoredMessage[], channelWindowSeconds = 300): G
 /** Packs complete groups where possible. Oversized threads are split only as a last resort,
  * retaining the root message in every continuation chunk. */
 export function makeDigestBatch(messages: StoredMessage[], options: DigestOptions, upperSequence: number): DigestBatch {
-  if (!Number.isInteger(options.maxTokens) || options.maxTokens < 128) throw new Error("maxTokens must be at least 128");
+  if (!Number.isInteger(options.maxBytes) || options.maxBytes < 128) throw new Error("maxBytes must be at least 128");
   const groups = groupMessages(messages, options.channelWindowSeconds);
   const selected: DigestGroup[] = [];
-  let used = 0;
 
   for (let index = 0; index < groups.length; index += 1) {
     const sourceGroup = groups[index];
     const group = makeGroup(sourceGroup.kind, sourceGroup.messages, sourceGroup.threadTs);
-    if (used + group.estimatedTokens <= options.maxTokens) {
+    const candidate = { groups: [...selected, group], ...(index < groups.length - 1 ? { hasMore: true } : {}) };
+    if (bytes(candidate) <= options.maxBytes) {
       selected.push(group);
-      used += group.estimatedTokens;
       continue;
     }
-    if (selected.length > 0) return { groups: selected, estimatedTokens: used, hasMore: true, upperSequence };
+    if (selected.length > 0) return { groups: selected, hasMore: true };
 
     // A single thread/window exceeds the caller's budget. Return the largest anchored prefix.
     const chunk: StoredMessage[] = [];
     const digestChunk: DigestMessage[] = [];
     let chunkTokens = 0;
     for (const message of sourceGroup.messages) {
-      const remaining = options.maxTokens - chunkTokens;
+      const remaining = options.maxBytes - chunkTokens;
       const projected = chunk.length === 0 ? makeMessageDigestSegment(message, remaining) : projectMessage(message);
-      const cost = estimateTokens(projected);
-      if (chunk.length > 0 && chunkTokens + cost > options.maxTokens) break;
+      const cost = bytes(projected);
+      if (chunk.length > 0 && chunkTokens + cost > options.maxBytes) break;
       chunk.push(message);
       digestChunk.push(projected);
       chunkTokens += cost;
     }
     const partial = makeGroup(sourceGroup.kind, chunk, sourceGroup.threadTs, digestChunk);
-    partial.threadContinues = chunk.length < sourceGroup.messages.length;
-    return { groups: [partial], estimatedTokens: partial.estimatedTokens, hasMore: true, upperSequence };
+    if (chunk.length < sourceGroup.messages.length) partial.threadContinues = true;
+    return { groups: [partial], hasMore: true };
   }
-  return { groups: selected, estimatedTokens: used, hasMore: false, upperSequence };
+  return { groups: selected };
 }

@@ -1,5 +1,5 @@
 import { Pool, type PoolClient } from "pg";
-import type { StoredMessage } from "./types.js";
+import type { StoredMessage, ThreadCheckpoint } from "./types.js";
 import type { UserVisibleConversation } from "./slack-conversations.js";
 import { defaultSettings, type ObserverSettings } from "./settings.js";
 import { conversationTypeFromSlackChannel, conversationTypeFromStoredValue, type ConversationType } from "./slack-conversation-type.js";
@@ -36,6 +36,11 @@ export class Database {
         PRIMARY KEY (consumer_id, event_id)
       );
       CREATE INDEX IF NOT EXISTS consumer_message_acks_event_idx ON consumer_message_acks (event_id);
+      CREATE TABLE IF NOT EXISTS consumer_thread_checkpoints (
+        consumer_id TEXT NOT NULL, workspace_id TEXT NOT NULL, channel_id TEXT NOT NULL, thread_ts TEXT NOT NULL,
+        covered_through_ts TEXT NOT NULL, checkpoint JSONB NOT NULL, updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+        PRIMARY KEY (consumer_id, workspace_id, channel_id, thread_ts)
+      );
       CREATE INDEX IF NOT EXISTS messages_thread_idx ON messages (workspace_id, channel_id, thread_ts, event_sequence);
       CREATE INDEX IF NOT EXISTS messages_identity_idx ON messages (workspace_id, channel_id, message_ts);
       CREATE INDEX IF NOT EXISTS messages_timestamp_idx ON messages (message_ts);
@@ -317,6 +322,7 @@ export class Database {
     await this.pool.query(
       `DELETE FROM thread_index i WHERE NOT EXISTS (SELECT 1 FROM messages m WHERE m.workspace_id = i.workspace_id AND m.channel_id = i.channel_id AND m.message_ts = i.root_ts)`,
     );
+    await this.pool.query(`DELETE FROM consumer_thread_checkpoints c WHERE NOT EXISTS (SELECT 1 FROM messages m WHERE m.workspace_id = c.workspace_id AND m.channel_id = c.channel_id AND m.message_ts = c.thread_ts)`);
   }
 
   async latestSequence(): Promise<number> {
@@ -354,9 +360,45 @@ export class Database {
       unknownEventIds: result.rows.filter((row) => !row.is_known).map((row) => row.event_id),
     };
   }
+  async saveThreadCheckpoint(consumerId: string, workspaceId: string, channelId: string, threadTs: string, coveredThroughTs: string, checkpoint: ThreadCheckpoint): Promise<void> {
+    await this.pool.query(`INSERT INTO consumer_thread_checkpoints (consumer_id, workspace_id, channel_id, thread_ts, covered_through_ts, checkpoint)
+      VALUES ($1, $2, $3, $4, $5, $6) ON CONFLICT (consumer_id, workspace_id, channel_id, thread_ts) DO UPDATE
+      SET covered_through_ts = EXCLUDED.covered_through_ts, checkpoint = EXCLUDED.checkpoint, updated_at = now()`, [consumerId, workspaceId, channelId, threadTs, coveredThroughTs, checkpoint]);
+  }
+  async acknowledgeMessagesAndSaveCheckpoint(consumerId: string, eventIds: string[], workspaceId: string, channelId: string, threadTs: string, coveredThroughTs: string, checkpoint: ThreadCheckpoint): Promise<{ acknowledgedEventIds: string[]; alreadyAcknowledgedEventIds: string[]; unknownEventIds: string[] }> {
+    const client = await this.pool.connect();
+    try {
+      await client.query("BEGIN");
+      const uniqueEventIds = [...new Set(eventIds)];
+      const result = await client.query<{ event_id: string; is_known: boolean; inserted: boolean }>(
+        `WITH input AS (SELECT DISTINCT unnest($2::text[]) AS event_id), known AS (SELECT input.event_id FROM input JOIN messages m USING (event_id)), inserted AS (
+          INSERT INTO consumer_message_acks (consumer_id, event_id) SELECT $1, event_id FROM known ON CONFLICT DO NOTHING RETURNING event_id
+        ) SELECT input.event_id, EXISTS (SELECT 1 FROM known WHERE known.event_id = input.event_id) AS is_known, EXISTS (SELECT 1 FROM inserted WHERE inserted.event_id = input.event_id) AS inserted FROM input`, [consumerId, uniqueEventIds],
+      );
+      await client.query(`INSERT INTO consumer_thread_checkpoints (consumer_id, workspace_id, channel_id, thread_ts, covered_through_ts, checkpoint)
+        VALUES ($1, $2, $3, $4, $5, $6) ON CONFLICT (consumer_id, workspace_id, channel_id, thread_ts) DO UPDATE
+        SET covered_through_ts = EXCLUDED.covered_through_ts, checkpoint = EXCLUDED.checkpoint, updated_at = now()`, [consumerId, workspaceId, channelId, threadTs, coveredThroughTs, checkpoint]);
+      await client.query("COMMIT");
+      return { acknowledgedEventIds: result.rows.filter((row) => row.inserted).map((row) => row.event_id), alreadyAcknowledgedEventIds: result.rows.filter((row) => row.is_known && !row.inserted).map((row) => row.event_id), unknownEventIds: result.rows.filter((row) => !row.is_known).map((row) => row.event_id) };
+    } catch (error) { await client.query("ROLLBACK"); throw error; } finally { client.release(); }
+  }
+  async threadCheckpoints(consumerId: string, messages: StoredMessage[]): Promise<Map<string, ThreadCheckpoint>> {
+    const keys = [...new Map(messages.filter((item) => item.threadTs).map((item) => [`${item.workspaceId}\u0000${item.channelId}\u0000${item.threadTs}`, item])).values()];
+    if (!keys.length) return new Map();
+    const values: string[] = [consumerId]; const clauses = keys.map((item) => { const i = values.length; values.push(item.workspaceId, item.channelId, item.threadTs!); return `(workspace_id = $${i + 1} AND channel_id = $${i + 2} AND thread_ts = $${i + 3})`; });
+    const result = await this.pool.query<{ workspace_id: string; channel_id: string; thread_ts: string; checkpoint: ThreadCheckpoint }>(`SELECT workspace_id, channel_id, thread_ts, checkpoint FROM consumer_thread_checkpoints WHERE consumer_id = $1 AND (${clauses.join(" OR ")})`, values);
+    return new Map(result.rows.map((row) => [`${row.workspace_id}\u0000${row.channel_id}\u0000${row.thread_ts}`, row.checkpoint]));
+  }
+  async reopenedThreads(consumerId: string, messages: StoredMessage[]): Promise<Set<string>> {
+    const keys = [...new Map(messages.filter((item) => item.threadTs).map((item) => [`${item.workspaceId}\u0000${item.channelId}\u0000${item.threadTs}`, item])).values()];
+    if (!keys.length) return new Set();
+    const values: string[] = [consumerId]; const clauses = keys.map((item) => { const i = values.length; values.push(item.workspaceId, item.channelId, item.threadTs!); return `(m.workspace_id = $${i + 1} AND m.channel_id = $${i + 2} AND (m.thread_ts = $${i + 3} OR m.message_ts = $${i + 3}))`; });
+    const result = await this.pool.query<{ workspace_id: string; channel_id: string; thread_ts: string }>(`SELECT DISTINCT m.workspace_id, m.channel_id, COALESCE(m.thread_ts, m.message_ts) AS thread_ts FROM messages m JOIN consumer_message_acks a ON a.event_id = m.event_id AND a.consumer_id = $1 WHERE ${clauses.join(" OR ")}`, values);
+    return new Set(result.rows.map((row) => `${row.workspace_id}\u0000${row.channel_id}\u0000${row.thread_ts}`));
+  }
   /** Returns the complete locally retained history for each touched thread. It performs no Slack API call. */
-  async hydrateThreads(changed: StoredMessage[]): Promise<StoredMessage[]> {
-    const keys = [...new Map(changed.filter((item) => item.threadTs).map((item) => [`${item.workspaceId}\u0000${item.channelId}\u0000${item.threadTs}`, item])).values()];
+  async hydrateThreads(changed: StoredMessage[], skipThreadKeys = new Set<string>()): Promise<StoredMessage[]> {
+    const keys = [...new Map(changed.filter((item) => item.threadTs && !skipThreadKeys.has(`${item.workspaceId}\u0000${item.channelId}\u0000${item.threadTs}`)).map((item) => [`${item.workspaceId}\u0000${item.channelId}\u0000${item.threadTs}`, item])).values()];
     if (!keys.length) return changed;
     const values: string[] = []; const clauses = keys.map((item) => { const index = values.length; values.push(item.workspaceId, item.channelId, item.threadTs!); return `(m.workspace_id = $${index + 1} AND m.channel_id = $${index + 2} AND (m.thread_ts = $${index + 3} OR m.message_ts = $${index + 3}))`; });
     const result = await this.pool.query<MessageRow>(`${messageSelect} WHERE ${clauses.join(" OR ")} ORDER BY m.event_sequence ASC`, values);

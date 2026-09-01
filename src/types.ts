@@ -19,17 +19,25 @@ export type StoredMessage = {
 
 /** The bounded message shape returned by digest tools. Raw Slack payloads stay in storage. */
 export type DigestMessage = {
-  eventId: string;
+  /** Slack timestamp; use it for continuation and source attribution. */
   messageTs: string;
-  userId: string | null;
-  subtype: string | null;
+  userId?: string;
+  subtype?: string;
   text: string | null;
   /** Unicode code-point offset for the next segment of this message's text. */
   textContinues?: number;
 };
 
+export type ThreadCheckpointFact = { text: string; sourceMessageTs: string; owner?: string; deadline?: string };
+export type ThreadCheckpoint = {
+  decisions?: ThreadCheckpointFact[];
+  actions?: ThreadCheckpointFact[];
+  blockers?: ThreadCheckpointFact[];
+  openQuestions?: ThreadCheckpointFact[];
+  importantContext?: ThreadCheckpointFact[];
+};
+
 export type DigestGroup = {
-  id: string;
   kind: "thread" | "channel_window";
   workspaceId: string;
   workspaceName?: string | null;
@@ -37,15 +45,15 @@ export type DigestGroup = {
   channelName?: string | null;
   conversationType: ConversationType;
   messages: DigestMessage[];
-  estimatedTokens: number;
   threadTs?: string;
-  threadContinues: boolean;
+  checkpoint?: ThreadCheckpoint;
+  threadContinues?: true;
+  /** The agent may attach a bounded, source-linked checkpoint when acknowledging this complete thread. */
+  checkpointSuggested?: true;
   ackToken?: string;
 };
 
 export type DigestBatch = {
   groups: DigestGroup[];
-  estimatedTokens: number;
-  hasMore: boolean;
-  upperSequence: number;
+  hasMore?: true;
 };

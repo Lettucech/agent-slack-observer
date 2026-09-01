@@ -61,7 +61,7 @@ test("uses a consumer inbox without requiring an agent cursor and acknowledges o
   await server.connect(serverTransport);
   await client.connect(clientTransport);
   try {
-    const digest = await client.callTool({ name: "get_digest_batches", arguments: { consumerId: "hermes", afterSequence: 999, maxTokens: 1000 } });
+    const digest = await client.callTool({ name: "get_digest_batches", arguments: { consumerId: "hermes", maxBytes: 1000 } });
     const digestBatch = digest.structuredContent as { groups: Array<{ ackToken?: string; conversationType: string }> };
     assert.equal(digestBatch.groups.length, 1);
     assert.equal(typeof digestBatch.groups[0].ackToken, "string");
@@ -69,11 +69,11 @@ test("uses a consumer inbox without requiring an agent cursor and acknowledges o
     assert.deepEqual(pendingCalls, [{ consumerId: "hermes", upperSequence: 9, settleSeconds: 90 }]);
 
     const ack = await client.callTool({ name: "ack_digest", arguments: { ackToken: digestBatch.groups[0].ackToken } });
-    assert.deepEqual(ack.structuredContent, { acknowledgedEventIds: ["Ev1"], alreadyAcknowledgedEventIds: [], unknownEventIds: [] });
+    assert.deepEqual(ack.structuredContent, { acknowledgedCount: 1, alreadyAcknowledgedCount: 0, unknownCount: 0 });
     assert.deepEqual(acknowledgements, [{ consumerId: "hermes", eventIds: ["Ev1"] }]);
 
-    const hermesAgain = await client.callTool({ name: "get_digest_batches", arguments: { consumerId: "hermes", maxTokens: 1000 } });
-    const anotherConsumer = await client.callTool({ name: "get_digest_batches", arguments: { consumerId: "another-agent", maxTokens: 1000 } });
+    const hermesAgain = await client.callTool({ name: "get_digest_batches", arguments: { consumerId: "hermes", maxBytes: 1000 } });
+    const anotherConsumer = await client.callTool({ name: "get_digest_batches", arguments: { consumerId: "another-agent", maxBytes: 1000 } });
     assert.equal((hermesAgain.structuredContent as { groups: unknown[] }).groups.length, 0);
     assert.equal((anotherConsumer.structuredContent as { groups: unknown[] }).groups.length, 1);
   } finally {
@@ -95,7 +95,7 @@ test("continues an oversized message without dropping text", async () => {
     let reconstructed = "";
     let finalAckToken: string | undefined;
     for (let index = 0; index < 20; index += 1) {
-      const result = await client.callTool({ name: "get_message_digest", arguments: { consumerId: "hermes", workspaceId: "T1", channelId: "C1", messageTs: "1000.0", afterTextOffset: offset, maxTokens: 128 } });
+      const result = await client.callTool({ name: "get_message_digest", arguments: { consumerId: "hermes", workspaceId: "T1", channelId: "C1", messageTs: "1000.0", afterTextOffset: offset, maxBytes: 128 } });
       const segment = result.structuredContent as { message: { text: string; textContinues?: number }; ackToken?: string };
       reconstructed += segment.message.text;
       if (segment.message.textContinues === undefined) {
@@ -134,8 +134,8 @@ test("normalizes numeric Slack timestamps coerced by an MCP client", async () =>
   await server.connect(serverTransport);
   await client.connect(clientTransport);
   try {
-    await client.callTool({ name: "get_message_digest", arguments: { consumerId: "hermes", workspaceId: "T1", channelId: "C1", messageTs: 1786501755.941399, afterTextOffset: 0, maxTokens: 128 } });
-    await client.callTool({ name: "get_thread_digest", arguments: { consumerId: "hermes", workspaceId: "T1", channelId: "C1", threadTs: 1786501755.941399, afterMessageTs: 1786501755.941399, maxTokens: 128 } });
+    await client.callTool({ name: "get_message_digest", arguments: { consumerId: "hermes", workspaceId: "T1", channelId: "C1", messageTs: 1786501755.941399, afterTextOffset: 0, maxBytes: 128 } });
+    await client.callTool({ name: "get_thread_digest", arguments: { consumerId: "hermes", workspaceId: "T1", channelId: "C1", threadTs: 1786501755.941399, afterMessageTs: 1786501755.941399, maxBytes: 128 } });
     assert.deepEqual(messageLookups, ["1786501755.941399"]);
     assert.deepEqual(threadLookups, [
       { threadTs: "1786501755.941399", afterMessageTs: "1786501755.941399" },
