@@ -79,7 +79,7 @@ Slack tokens are stored in the local PostgreSQL volume so the dashboard can appl
 ## What happens on a new message
 
 1. The observer opens an outbound Socket Mode WebSocket to Slack with its restricted app-level token.
-2. Slack sends an event envelope down that socket; the observer stores the raw event and a normalized message in PostgreSQL.
+2. Slack sends an event envelope down that socket; the observer stores the raw event and creates a normalized consumer message only for an included observation target. Edited and deleted messages use Slack's nested current/previous text fields.
 3. `event_id` is unique, so Slack retries cannot create duplicate records.
 4. The observer acknowledges the socket envelope. This is delivery protocol traffic only, **not** a Slack channel reply.
 

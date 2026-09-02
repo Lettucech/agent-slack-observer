@@ -1,9 +1,9 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { makeDigestBatch } from "../src/digest.js";
+import { makeDigestBatch, makeMessageDigestSegment } from "../src/digest.js";
 import type { StoredMessage } from "../src/types.js";
 
-function message(sequence: number, ts: string, text: string, threadTs: string | null = null, payload: Record<string, unknown> = {}): StoredMessage {
+function message(sequence: number, ts: string, text: string | null, threadTs: string | null = null, payload: Record<string, unknown> = {}): StoredMessage {
   return { eventId: `Ev${sequence}`, eventSequence: sequence, workspaceId: "T1", channelId: "C1", conversationType: "im", messageTs: ts, threadTs, userId: "U1", subtype: null, text, payload, observedAt: "2026-08-11T00:00:00Z" };
 }
 
@@ -63,4 +63,12 @@ test("uses a compact, complete-response byte budget", () => {
   assert.equal("eventId" in batch.groups[0].messages[0], false);
   assert.equal("estimatedTokens" in batch.groups[0], false);
   assert.equal("upperSequence" in batch, false);
+});
+
+test("preserves null text in batch and individual digest projections", () => {
+  const stored = message(1, "1000.000001", null);
+  const batch = makeDigestBatch([stored], { maxBytes: 1_024 }, 1);
+
+  assert.equal(batch.groups[0].messages[0].text, null);
+  assert.equal(makeMessageDigestSegment(stored, 1_024).text, null);
 });

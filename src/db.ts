@@ -119,8 +119,7 @@ export class Database {
     );
     if (insert.rowCount === 0) return { inserted: false };
     const eventSequence = Number(insert.rows[0].event_sequence);
-    if (event.type === "message" && typeof event.channel === "string" && typeof event.ts === "string") {
-      await this.upsertTarget(workspaceId, event.channel);
+    if (event.type === "message" && typeof event.channel === "string" && typeof event.ts === "string" && await this.observationTargetIsEnabled(workspaceId, event.channel)) {
       await this.saveChannelConversationType(workspaceId, event.channel, conversationTypeFromSlackChannel(event));
       await this.insertMessageIfAbsent(eventId, eventSequence, workspaceId, event.channel, event, new Date().toISOString());
     }
@@ -484,12 +483,16 @@ export class Database {
     if (existing.rowCount) return { job: await this.getBackfillJob(Number(existing.rows[0].id)), targetCount: 0 };
     return this.createBackfillJob("downtime", window.startAt, window.endAt, retentionDays);
   }
+  private async observationTargetIsEnabled(workspaceId: string, channelId: string): Promise<boolean> {
+    const result = await this.pool.query<{ enabled: boolean }>("SELECT enabled FROM observation_targets WHERE workspace_id = $1 AND channel_id = $2", [workspaceId, channelId]);
+    return result.rows[0]?.enabled === true;
+  }
   private async upsertTarget(workspaceId: string, channelId: string): Promise<void> { await this.pool.query(`INSERT INTO observation_targets (workspace_id, channel_id) VALUES ($1, $2) ON CONFLICT (workspace_id, channel_id) DO UPDATE SET updated_at = now()`, [workspaceId, channelId]); }
   private async saveChannelConversationType(workspaceId: string, channelId: string, conversationType: ConversationType): Promise<void> { await this.pool.query(`INSERT INTO channel_metadata (workspace_id, channel_id, conversation_type) VALUES ($1, $2, $3) ON CONFLICT (workspace_id, channel_id) DO UPDATE SET conversation_type = CASE WHEN EXCLUDED.conversation_type = 'unknown' THEN channel_metadata.conversation_type ELSE EXCLUDED.conversation_type END`, [workspaceId, channelId, conversationType]); }
   private async insertMessageIfAbsent(eventId: string, eventSequence: number, workspaceId: string, channelId: string, message: Record<string, unknown>, observedAt: string, client: Pool | PoolClient = this.pool): Promise<void> {
     const exists = await client.query<{ event_id: string }>(`SELECT event_id FROM messages WHERE workspace_id = $1 AND channel_id = $2 AND message_ts = $3 LIMIT 1`, [workspaceId, channelId, message.ts]);
     if (exists.rowCount) return;
-    await client.query(`INSERT INTO messages (event_id, event_sequence, workspace_id, channel_id, message_ts, thread_ts, user_id, subtype, text, event_payload, observed_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)`, [eventId, eventSequence, workspaceId, channelId, message.ts, stringValue(message.thread_ts), stringValue(message.user), stringValue(message.subtype), stringValue(message.text), message, observedAt]);
+    await client.query(`INSERT INTO messages (event_id, event_sequence, workspace_id, channel_id, message_ts, thread_ts, user_id, subtype, text, event_payload, observed_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)`, [eventId, eventSequence, workspaceId, channelId, message.ts, stringValue(message.thread_ts), stringValue(message.user), stringValue(message.subtype), textForSlackMessageEvent(message), message, observedAt]);
   }
   private async finishJobIfDone(taskId: number): Promise<void> { await this.pool.query(`UPDATE backfill_jobs j SET state = 'completed', completed_at = now(), updated_at = now() WHERE j.id = (SELECT job_id FROM backfill_tasks WHERE id = $1) AND NOT EXISTS (SELECT 1 FROM backfill_tasks t WHERE t.job_id = j.id AND t.state NOT IN ('completed', 'canceled'))`, [taskId]); }
   private async getBackfillJob(id: number): Promise<BackfillJob> { const jobs = await this.pool.query<JobRow>(`SELECT j.id::text, j.kind, j.state, j.requested_start_at::text, j.requested_end_at::text, j.created_at::text, j.completed_at::text, j.last_error, count(DISTINCT (t.workspace_id, t.channel_id))::text AS channels, count(*) FILTER (WHERE t.state = 'completed')::text AS completed_tasks, count(*)::text AS total_tasks, count(*) FILTER (WHERE t.phase = 'history')::text AS history_tasks, count(*) FILTER (WHERE t.phase = 'replies')::text AS reply_tasks FROM backfill_jobs j LEFT JOIN backfill_tasks t ON t.job_id = j.id WHERE j.id = $1 GROUP BY j.id`, [id]); return toJob(jobs.rows[0]); }
@@ -507,6 +510,11 @@ function toTask(row: TaskRow): BackfillTask { return { id: Number(row.id), jobId
 function toJob(row: JobRow): BackfillJob { return { id: Number(row.id), kind: row.kind, state: row.state, requestedStartAt: row.requested_start_at, requestedEndAt: row.requested_end_at, createdAt: row.created_at, completedAt: row.completed_at, channels: Number(row.channels), completedTasks: Number(row.completed_tasks), totalTasks: Number(row.total_tasks), historyTasks: Number(row.history_tasks), replyTasks: Number(row.reply_tasks), lastError: row.last_error }; }
 function historyEventId(workspaceId: string, channelId: string, ts: string): string { return `history:${workspaceId}:${channelId}:${ts}`; }
 function stringValue(value: unknown): string | null { return typeof value === "string" ? value : null; }
+export function textForSlackMessageEvent(message: Record<string, unknown>): string | null {
+  if (message.subtype === "message_changed") return isObject(message.message) ? stringValue(message.message.text) : null;
+  if (message.subtype === "message_deleted") return isObject(message.previous_message) ? stringValue(message.previous_message.text) : null;
+  return stringValue(message.text);
+}
 function numberValue(value: unknown): number | null { return typeof value === "number" && Number.isInteger(value) && value >= 0 ? value : null; }
 function compareSlackTimestamp(left: SlackHistoryMessage, right: SlackHistoryMessage): number { return Number(left.ts) - Number(right.ts); }
 function isObject(value: unknown): value is Record<string, unknown> { return typeof value === "object" && value !== null && !Array.isArray(value); }

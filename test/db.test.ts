@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { backfillWindow, detectedRecoveryWindow, historyCheckpointStatement, toConsumerProgress } from "../src/db.js";
+import { backfillWindow, Database, detectedRecoveryWindow, historyCheckpointStatement, textForSlackMessageEvent, toConsumerProgress } from "../src/db.js";
 
 test("finishes the last history page without binding an untyped null cursor", () => {
   const statement = historyCheckpointStatement(42, null);
@@ -38,4 +38,51 @@ test("detects only qualifying Socket Mode gaps and bounds recovery to retention"
   assert.deepEqual(detectedRecoveryWindow(new Date("2026-07-01T00:00:00.000Z"), recoveredAt, 300, 30), {
     startAt: new Date("2026-08-01T12:00:00.000Z"), endAt: recoveredAt,
   });
+});
+
+test("uses the changed message text from a Slack message_changed event", () => {
+  assert.equal(textForSlackMessageEvent({ subtype: "message_changed", text: "", message: { text: "After edit" } }), "After edit");
+});
+
+test("uses the previous message text from a Slack message_deleted event", () => {
+  assert.equal(textForSlackMessageEvent({ subtype: "message_deleted", text: "", previous_message: { text: "Before deletion" } }), "Before deletion");
+});
+
+test("does not create a consumer message for a disabled observation target", async () => {
+  const queries: Array<{ text: string; values: unknown[] | undefined }> = [];
+  const database = Object.create(Database.prototype) as Database;
+  (database as unknown as { pool: { query: (text: string, values?: unknown[]) => Promise<unknown> } }).pool = {
+    query: async (text: string, values?: unknown[]) => {
+      queries.push({ text, values });
+      if (text.includes("INSERT INTO slack_events")) return { rowCount: 1, rows: [{ event_sequence: "1" }] };
+      if (text.includes("SELECT enabled FROM observation_targets")) return { rowCount: 1, rows: [{ enabled: false }] };
+      throw new Error(`Unexpected query: ${text}`);
+    },
+  };
+
+  await database.storeEnvelope({ event_id: "Ev-disabled", team_id: "T1", type: "event_callback", event: { type: "message", channel: "C-disabled", ts: "1.0", text: "ignored" } });
+
+  assert.equal(queries.length, 2);
+  assert.equal(queries.some((query) => query.text.includes("INSERT INTO messages")), false);
+});
+
+test("stores normalized changed text for an enabled observation target", async () => {
+  const queries: Array<{ text: string; values: unknown[] | undefined }> = [];
+  const database = Object.create(Database.prototype) as Database;
+  (database as unknown as { pool: { query: (text: string, values?: unknown[]) => Promise<unknown> } }).pool = {
+    query: async (text: string, values?: unknown[]) => {
+      queries.push({ text, values });
+      if (text.includes("INSERT INTO slack_events")) return { rowCount: 1, rows: [{ event_sequence: "1" }] };
+      if (text.includes("SELECT enabled FROM observation_targets")) return { rowCount: 1, rows: [{ enabled: true }] };
+      if (text.includes("INSERT INTO channel_metadata")) return { rowCount: 1, rows: [] };
+      if (text.includes("SELECT event_id FROM messages")) return { rowCount: 0, rows: [] };
+      if (text.includes("INSERT INTO messages")) return { rowCount: 1, rows: [] };
+      throw new Error(`Unexpected query: ${text}`);
+    },
+  };
+
+  await database.storeEnvelope({ event_id: "Ev-changed", team_id: "T1", type: "event_callback", event: { type: "message", channel: "C-enabled", ts: "1.0", subtype: "message_changed", message: { text: "After edit" } } });
+
+  const insert = queries.find((query) => query.text.includes("INSERT INTO messages"));
+  assert.equal(insert?.values?.[8], "After edit");
 });

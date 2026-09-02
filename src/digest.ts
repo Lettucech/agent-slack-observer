@@ -29,7 +29,11 @@ function projectMessage(message: StoredMessage, text = message.text, textContinu
 export function makeMessageDigestSegment(message: StoredMessage, maxTokens: number, afterTextOffset = 0): DigestMessage {
   if (!Number.isInteger(maxTokens) || maxTokens < 128) throw new Error("maxBytes must be at least 128");
   if (!Number.isInteger(afterTextOffset) || afterTextOffset < 0) throw new Error("afterTextOffset must be a non-negative integer");
-  const characters = Array.from(message.text ?? "");
+  if (message.text === null) {
+    if (afterTextOffset > 0) throw new Error("afterTextOffset is beyond the message text");
+    return projectMessage(message, null);
+  }
+  const characters = Array.from(message.text);
   if (afterTextOffset > characters.length) throw new Error("afterTextOffset is beyond the message text");
 
   const full = projectMessage(message, characters.slice(afterTextOffset).join(""));
