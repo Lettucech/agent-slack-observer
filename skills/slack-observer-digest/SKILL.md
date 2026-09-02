@@ -5,7 +5,7 @@ description: Retrieve, digest, acknowledge, and summarize messages from an Agent
 
 # Slack Observer Digest
 
-Use the observer as a Slack read-only inbox. It monitors conversations chosen by its owner, including channels and DMs; never reply in Slack, alter Slack state, or use Slack history/search APIs as part of this workflow. `ack_digest` only updates this consumer's local delivery state; it never changes Slack or deletes retained observer data.
+Use the observer as a Slack read-only inbox. It monitors conversations chosen by its owner, including channels and DMs; never reply in Slack, alter Slack state, or use Slack history/search APIs as part of this workflow. `ack_digest` only updates this consumer's local delivery state; it never changes Slack or deletes retained observer data. The owner can turn a conversation's coverage off at any time; its stored messages are then removed from every consumer inbox without acknowledgement, so a conversation disappearing between runs is expected, not an observer failure. Treat a shrunk inbox as normal and continue from whatever remains.
 
 ## Before reading
 

@@ -45,6 +45,7 @@ The dashboard stores Slack credentials, the generated MCP bearer token, and runt
 | Raw event retention days | 7 | Retain raw Socket Mode and backfill payloads. |
 | Backfill interval seconds | 60 | Minimum spacing between history and replies calls. |
 | Recover Socket Mode gap after seconds | 300 | Minimum confirmed gap before an automatic recovery is queued. |
+| Conversation name filter | — | Comma-separated name fragments; matching conversations are forced off, blocked from enabling, and their stored messages are deleted. |
 
 ### Why the Slack App-Level Token is needed
 
@@ -97,7 +98,7 @@ For a first-time index, let the dashboard job finish before allowing an agent to
 
 The dashboard can also enqueue an explicit start/end time window. After Socket Mode reconnects, a confirmed gap longer than the configured threshold automatically queues recovery for included conversations. That recovery is bounded to the actual missing window and the retention window, is persistent and globally serial, and can be cancelled from the dashboard. Each page cursor, retry time, and current task is stored in PostgreSQL, so a restart resumes at the next request. `429` responses respect Slack's `Retry-After` value.
 
-Backfill covers only conversations in recovery coverage. With a configured user token, **Find accessible conversations** can list completely quiet conversations using `conversations.list`, but they remain excluded until you choose **Include**; otherwise the observer intentionally does not discover them. The full thread guarantee is bounded by the configured message retention window: an old root outside that retained index can only be reconstructed by a separate historical scan.
+Backfill covers only conversations in recovery coverage. With a configured user token, **Find accessible conversations** can list completely quiet conversations using `conversations.list`, but they remain excluded until you choose **Include**; otherwise the observer intentionally does not discover them. The coverage list is sorted alphabetically, turned-off conversations collapse into their own section, and turning coverage off (or a matching coverage name filter) immediately deletes that conversation's locally stored messages, thread index, checkpoints, raw events, and pending recovery tasks; re-enabling does not restore them. **Clean up turned-off messages** performs the same deletion sweep across every already turned-off conversation, for data accumulated before that automatic cleanup existed. The full thread guarantee is bounded by the configured message retention window: an old root outside that retained index can only be reconstructed by a separate historical scan.
 
 ## Retention
 

@@ -10,6 +10,7 @@ export type ObserverSettings = {
   rawEventRetentionDays: number;
   backfillRequestIntervalSeconds: number;
   downtimeSuggestionSeconds: number;
+  conversationNameFilterTerms: string;
 };
 
 export type DashboardSettings = Omit<ObserverSettings, "slackAppToken" | "slackUserToken" | "slackBotToken" | "mcpAuthToken"> & {
@@ -30,6 +31,7 @@ export const defaultSettings: ObserverSettings = {
   rawEventRetentionDays: 7,
   backfillRequestIntervalSeconds: 60,
   downtimeSuggestionSeconds: 300,
+  conversationNameFilterTerms: "",
 };
 
 export function dashboardSettings(settings: ObserverSettings): DashboardSettings {
@@ -48,6 +50,7 @@ export function dashboardSettings(settings: ObserverSettings): DashboardSettings
     rawEventRetentionDays: settings.rawEventRetentionDays,
     backfillRequestIntervalSeconds: settings.backfillRequestIntervalSeconds,
     downtimeSuggestionSeconds: settings.downtimeSuggestionSeconds,
+    conversationNameFilterTerms: settings.conversationNameFilterTerms,
   };
 }
 
@@ -68,6 +71,8 @@ export function settingsFromInput(existing: ObserverSettings, input: unknown): O
     rawEventRetentionDays: integer(body, "rawEventRetentionDays", existing.rawEventRetentionDays, 1, 3650),
     backfillRequestIntervalSeconds: integer(body, "backfillRequestIntervalSeconds", existing.backfillRequestIntervalSeconds, 1, 86_400),
     downtimeSuggestionSeconds: integer(body, "downtimeSuggestionSeconds", existing.downtimeSuggestionSeconds, 1, 86_400),
+    // Unlike secrets, an explicitly empty value clears the filter rather than keeping the previous one.
+    conversationNameFilterTerms: text(body, "conversationNameFilterTerms", existing.conversationNameFilterTerms),
   };
   return validateSettingsInput(candidate);
 }
@@ -89,6 +94,7 @@ export function validateSettingsInput(input: unknown): ObserverSettings {
     rawEventRetentionDays: integer(body, "rawEventRetentionDays", defaultSettings.rawEventRetentionDays, 1, 3650),
     backfillRequestIntervalSeconds: integer(body, "backfillRequestIntervalSeconds", defaultSettings.backfillRequestIntervalSeconds, 1, 86_400),
     downtimeSuggestionSeconds: integer(body, "downtimeSuggestionSeconds", defaultSettings.downtimeSuggestionSeconds, 1, 86_400),
+    conversationNameFilterTerms: text(body, "conversationNameFilterTerms", defaultSettings.conversationNameFilterTerms),
   };
 }
 
@@ -121,4 +127,10 @@ function integer(body: Record<string, unknown>, name: string, fallback: number, 
   const number = typeof value === "number" ? value : Number(value);
   if (!Number.isInteger(number) || number < minimum || number > maximum) throw new Error(`${name} must be an integer from ${minimum} to ${maximum}`);
   return number;
+}
+function text(body: Record<string, unknown>, name: string, fallback: string): string {
+  const value = body[name];
+  if (value === undefined || value === null) return fallback;
+  if (typeof value !== "string") throw new Error(`${name} must be a string`);
+  return value.trim();
 }

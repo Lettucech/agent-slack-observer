@@ -3,6 +3,7 @@ import type { StoredMessage, ThreadCheckpoint } from "./types.js";
 import type { UserVisibleConversation } from "./slack-conversations.js";
 import { defaultSettings, type ObserverSettings } from "./settings.js";
 import { conversationTypeFromSlackChannel, conversationTypeFromStoredValue, type ConversationType } from "./slack-conversation-type.js";
+import { filterPatterns, parseFilterTerms } from "./conversation-filter.js";
 
 export type SlackEnvelope = { event_id?: unknown; team_id?: unknown; api_app_id?: unknown; type?: unknown; event?: unknown };
 export type SlackHistoryMessage = Record<string, unknown> & { ts: string; type?: string; thread_ts?: string; reply_count?: number; latest_reply?: string };
@@ -105,6 +106,7 @@ export class Database {
         updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
       );
       INSERT INTO observer_settings (singleton) VALUES (true) ON CONFLICT (singleton) DO NOTHING;
+      ALTER TABLE observer_settings ADD COLUMN IF NOT EXISTS conversation_name_filter_terms TEXT NOT NULL DEFAULT '';
     `);
   }
 
@@ -127,6 +129,8 @@ export class Database {
   }
 
   async storeHistoryPage(task: BackfillTask, messages: SlackHistoryMessage[]): Promise<void> {
+    // Coverage can be turned off mid-job; a disabled conversation must not refill its purged history.
+    if (!(await this.observationTargetIsEnabled(task.workspaceId, task.channelId))) return;
     const client = await this.pool.connect();
     try {
       await client.query("BEGIN");
@@ -168,6 +172,7 @@ export class Database {
 
   async storeReplies(task: BackfillTask, messages: SlackHistoryMessage[]): Promise<void> {
     if (!task.rootTs) throw new Error("Reply task is missing root_ts");
+    if (!(await this.observationTargetIsEnabled(task.workspaceId, task.channelId))) return;
     const client = await this.pool.connect();
     try {
       await client.query("BEGIN");
@@ -242,6 +247,55 @@ export class Database {
   }
   async setObservationTargetEnabled(workspaceId: string, channelId: string, enabled: boolean): Promise<void> {
     await this.pool.query(`UPDATE observation_targets SET enabled = $3, updated_at = now() WHERE workspace_id = $1 AND channel_id = $2`, [workspaceId, channelId, enabled]);
+  }
+
+  async conversationName(workspaceId: string, channelId: string): Promise<string | null> {
+    const result = await this.pool.query<{ channel_name: string | null }>("SELECT channel_name FROM channel_metadata WHERE workspace_id = $1 AND channel_id = $2", [workspaceId, channelId]);
+    return result.rows[0]?.channel_name ?? null;
+  }
+
+  /** Turns a conversation off and deletes everything locally retained about it. Acknowledgements cascade with messages. Returns the deleted message count. */
+  async purgeConversationData(workspaceId: string, channelId: string): Promise<number> {
+    const client = await this.pool.connect();
+    try {
+      await client.query("BEGIN");
+      const deleted = await client.query(`DELETE FROM messages WHERE workspace_id = $1 AND channel_id = $2`, [workspaceId, channelId]);
+      await client.query(`DELETE FROM thread_index WHERE workspace_id = $1 AND channel_id = $2`, [workspaceId, channelId]);
+      await client.query(`DELETE FROM consumer_thread_checkpoints WHERE workspace_id = $1 AND channel_id = $2`, [workspaceId, channelId]);
+      // Raw events carry the channel inside the payload, not as a column.
+      await client.query(`DELETE FROM slack_events WHERE workspace_id = $1 AND coalesce(payload->'event'->>'channel', payload->>'channel') = $2`, [workspaceId, channelId]);
+      await client.query(`UPDATE backfill_tasks SET state = 'canceled', updated_at = now() WHERE workspace_id = $1 AND channel_id = $2 AND state IN ('queued', 'retry')`, [workspaceId, channelId]);
+      await client.query(`UPDATE backfill_jobs j SET state = 'completed', completed_at = now(), updated_at = now()
+        WHERE j.state IN ('queued', 'running')
+          AND EXISTS (SELECT 1 FROM backfill_tasks t WHERE t.job_id = j.id AND t.workspace_id = $1 AND t.channel_id = $2)
+          AND NOT EXISTS (SELECT 1 FROM backfill_tasks t WHERE t.job_id = j.id AND t.state NOT IN ('completed', 'canceled'))`, [workspaceId, channelId]);
+      await client.query("COMMIT");
+      return deleted.rowCount ?? 0;
+    } catch (error) { await client.query("ROLLBACK"); throw error; } finally { client.release(); }
+  }
+
+  /** One-off sweep for conversations turned off before cleanup-on-toggle-off existed. */
+  async purgeDisabledConversationData(): Promise<{ conversations: number; messagesDeleted: number }> {
+    const disabled = await this.pool.query<{ workspace_id: string; channel_id: string }>("SELECT workspace_id, channel_id FROM observation_targets WHERE enabled = false");
+    let messagesDeleted = 0;
+    for (const row of disabled.rows) messagesDeleted += await this.purgeConversationData(row.workspace_id, row.channel_id);
+    return { conversations: disabled.rowCount ?? 0, messagesDeleted };
+  }
+
+  /** Forces every enabled conversation whose stored name matches the filter off, purging its data. Returns the disabled names. */
+  async disableFilteredConversations(rawTerms: string): Promise<string[]> {
+    const terms = parseFilterTerms(rawTerms);
+    if (!terms.length) return [];
+    const candidates = await this.pool.query<{ workspace_id: string; channel_id: string; channel_name: string | null }>(
+      `SELECT t.workspace_id, t.channel_id, cm.channel_name FROM observation_targets t
+       JOIN channel_metadata cm ON cm.workspace_id = t.workspace_id AND cm.channel_id = t.channel_id
+       WHERE t.enabled AND cm.channel_name ILIKE ANY($1::text[])`, [filterPatterns(terms)],
+    );
+    for (const candidate of candidates.rows) {
+      await this.setObservationTargetEnabled(candidate.workspace_id, candidate.channel_id, false);
+      await this.purgeConversationData(candidate.workspace_id, candidate.channel_id);
+    }
+    return candidates.rows.map((row) => row.channel_name ?? row.channel_id);
   }
 
   async claimBackfillTask(): Promise<BackfillTask | null> {
@@ -419,7 +473,7 @@ export class Database {
       `SELECT t.workspace_id, wm.workspace_name, t.channel_id, cm.channel_name, cm.conversation_type, t.enabled, count(m.event_id)::text AS message_count, max(m.observed_at)::text AS last_observed_at
        FROM observation_targets t LEFT JOIN messages m ON m.workspace_id = t.workspace_id AND m.channel_id = t.channel_id
        LEFT JOIN workspace_metadata wm ON wm.workspace_id = t.workspace_id LEFT JOIN channel_metadata cm ON cm.workspace_id = t.workspace_id AND cm.channel_id = t.channel_id
-      GROUP BY t.workspace_id, wm.workspace_name, t.channel_id, cm.channel_name, cm.conversation_type, t.enabled ORDER BY max(m.observed_at) DESC NULLS LAST, t.channel_id`,
+      GROUP BY t.workspace_id, wm.workspace_name, t.channel_id, cm.channel_name, cm.conversation_type, t.enabled ORDER BY lower(coalesce(cm.channel_name, t.channel_id)), t.workspace_id`,
     );
     return result.rows.map((row) => ({ workspaceId: row.workspace_id, workspaceName: row.workspace_name, channelId: row.channel_id, channelName: row.channel_name, conversationType: conversationTypeFromStoredValue(row.conversation_type), enabled: row.enabled, messageCount: Number(row.message_count), lastObservedAt: row.last_observed_at }));
   }
@@ -458,17 +512,18 @@ export class Database {
     const row = result.rows[0]; return { events: Number(row.events), messages: Number(row.messages), lastReceivedAt: row.last_received_at, channels: Number(row.channels), earliestMessageAt: row.earliest_message_at, nextBackfillRequestAt: row.next_request_at, consumers: consumers.rows.map(toConsumerProgress) };
   }
   async observerSettings(): Promise<ObserverSettings> {
-    const result = await this.pool.query<SettingsRow>(`SELECT slack_app_token, slack_user_token, slack_bot_token, mcp_auth_token, thread_settle_seconds, message_retention_days, raw_event_retention_days, backfill_request_interval_seconds, downtime_suggestion_seconds FROM observer_settings WHERE singleton`);
+    const result = await this.pool.query<SettingsRow>(`SELECT slack_app_token, slack_user_token, slack_bot_token, mcp_auth_token, thread_settle_seconds, message_retention_days, raw_event_retention_days, backfill_request_interval_seconds, downtime_suggestion_seconds, conversation_name_filter_terms FROM observer_settings WHERE singleton`);
     const row = result.rows[0];
     if (!row) return { ...defaultSettings };
     return {
       slackAppToken: row.slack_app_token ?? undefined, slackUserToken: row.slack_user_token ?? undefined, slackBotToken: row.slack_bot_token ?? undefined, mcpAuthToken: row.mcp_auth_token ?? undefined,
       threadSettleSeconds: row.thread_settle_seconds, messageRetentionDays: row.message_retention_days, rawEventRetentionDays: row.raw_event_retention_days,
       backfillRequestIntervalSeconds: row.backfill_request_interval_seconds, downtimeSuggestionSeconds: row.downtime_suggestion_seconds,
+      conversationNameFilterTerms: row.conversation_name_filter_terms,
     };
   }
   async saveObserverSettings(settings: ObserverSettings): Promise<void> {
-    await this.pool.query(`UPDATE observer_settings SET slack_app_token = $1, slack_user_token = $2, slack_bot_token = $3, mcp_auth_token = $4, thread_settle_seconds = $5, message_retention_days = $6, raw_event_retention_days = $7, backfill_request_interval_seconds = $8, downtime_suggestion_seconds = $9, updated_at = now() WHERE singleton`, [settings.slackAppToken ?? null, settings.slackUserToken ?? null, settings.slackBotToken ?? null, settings.mcpAuthToken ?? null, settings.threadSettleSeconds, settings.messageRetentionDays, settings.rawEventRetentionDays, settings.backfillRequestIntervalSeconds, settings.downtimeSuggestionSeconds]);
+    await this.pool.query(`UPDATE observer_settings SET slack_app_token = $1, slack_user_token = $2, slack_bot_token = $3, mcp_auth_token = $4, thread_settle_seconds = $5, message_retention_days = $6, raw_event_retention_days = $7, backfill_request_interval_seconds = $8, downtime_suggestion_seconds = $9, conversation_name_filter_terms = $10, updated_at = now() WHERE singleton`, [settings.slackAppToken ?? null, settings.slackUserToken ?? null, settings.slackBotToken ?? null, settings.mcpAuthToken ?? null, settings.threadSettleSeconds, settings.messageRetentionDays, settings.rawEventRetentionDays, settings.backfillRequestIntervalSeconds, settings.downtimeSuggestionSeconds, settings.conversationNameFilterTerms]);
   }
   async close(): Promise<void> { await this.pool.end(); }
 
@@ -503,7 +558,7 @@ type MessageRow = { event_id: string; event_sequence: string; workspace_id: stri
 type TaskRow = { id: string; job_id: string; workspace_id: string; channel_id: string; phase: "history" | "replies"; cursor: string | null; root_ts: string | null; oldest: string; latest: string; attempts: number };
 type ChannelRow = { workspace_id: string; workspace_name: string | null; channel_id: string; channel_name: string | null; conversation_type: string | null; enabled: boolean; message_count: string; last_observed_at: string | null };
 type JobRow = { id: string; kind: "initial" | "manual" | "downtime"; state: string; requested_start_at: string; requested_end_at: string; created_at: string; completed_at: string | null; last_error: string | null; channels: string; completed_tasks: string; total_tasks: string; history_tasks: string; reply_tasks: string };
-type SettingsRow = { slack_app_token: string | null; slack_user_token: string | null; slack_bot_token: string | null; mcp_auth_token: string | null; thread_settle_seconds: number; message_retention_days: number; raw_event_retention_days: number; backfill_request_interval_seconds: number; downtime_suggestion_seconds: number };
+type SettingsRow = { slack_app_token: string | null; slack_user_token: string | null; slack_bot_token: string | null; mcp_auth_token: string | null; thread_settle_seconds: number; message_retention_days: number; raw_event_retention_days: number; backfill_request_interval_seconds: number; downtime_suggestion_seconds: number; conversation_name_filter_terms: string };
 function toStoredMessage(row: MessageRow): StoredMessage { return { eventId: row.event_id, eventSequence: Number(row.event_sequence), workspaceId: row.workspace_id, channelId: row.channel_id, conversationType: conversationTypeFromStoredValue(row.conversation_type), messageTs: row.message_ts, threadTs: row.thread_ts, userId: row.user_id, subtype: row.subtype, text: row.text, payload: row.event_payload, observedAt: row.observed_at, workspaceName: row.workspace_name, channelName: row.channel_name }; }
 export function toConsumerProgress(row: { consumer_id: string; total_messages: string; acknowledged_messages: string; pending_messages: string; last_acknowledged_at: string | null }): ConsumerProgress { return { consumerId: row.consumer_id, totalMessages: Number(row.total_messages), acknowledgedMessages: Number(row.acknowledged_messages), pendingMessages: Number(row.pending_messages), lastAcknowledgedAt: row.last_acknowledged_at }; }
 function toTask(row: TaskRow): BackfillTask { return { id: Number(row.id), jobId: Number(row.job_id), workspaceId: row.workspace_id, channelId: row.channel_id, phase: row.phase, cursor: row.cursor, rootTs: row.root_ts, oldest: row.oldest, latest: row.latest, attempts: row.attempts }; }

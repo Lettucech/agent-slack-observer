@@ -1,5 +1,6 @@
 import express, { type NextFunction, type Request, type Response } from "express";
 import { bootstrapConfig } from "./config.js";
+import { conversationNameMatchesFilter, parseFilterTerms } from "./conversation-filter.js";
 import { Database } from "./db.js";
 import { createMcpRequestHandler, createMcpTransport } from "./mcp.js";
 import { ObserverRuntime, testSlackConnection } from "./runtime.js";
@@ -38,8 +39,10 @@ app.post("/dashboard/settings", async (request, response, next) => {
     const mcpAuthToken = candidate.mcpAuthToken ?? newMcpAuthToken();
     const saved = { ...candidate, mcpAuthToken };
     await database.saveObserverSettings(saved);
+    // A narrowed or newly populated filter immediately forces matching conversations off and purges them.
+    const filteredOffNames = await database.disableFilteredConversations(saved.conversationNameFilterTerms);
     await runtime.apply(saved);
-    response.json({ settings: dashboardSettings(saved), mcpAuthToken: current.mcpAuthToken ? undefined : mcpAuthToken });
+    response.json({ settings: dashboardSettings(saved), mcpAuthToken: current.mcpAuthToken ? undefined : mcpAuthToken, filteredOffNames });
   } catch (error) { next(error); }
 });
 app.post("/dashboard/settings/mcp-token", async (_request, response, next) => {
@@ -66,17 +69,36 @@ app.post("/dashboard/targets", async (request, response, next) => {
     response.status(201).json({ workspaceId, channelId });
   } catch (error) { next(error); }
 });
+app.post("/dashboard/targets/cleanup", async (_request, response, next) => {
+  try { response.json(await database.purgeDisabledConversationData()); } catch (error) { next(error); }
+});
 app.post("/dashboard/targets/coverage", async (request, response, next) => {
   try {
     const workspaceId = inputString(request.body, "workspaceId"); const channelId = inputString(request.body, "channelId");
     if (typeof request.body?.enabled !== "boolean") throw new Error("enabled must be a boolean");
-    await database.setObservationTargetEnabled(workspaceId, channelId, request.body.enabled);
-    if (request.body.enabled) runtime.scheduleMetadata(workspaceId, channelId);
+    if (request.body.enabled) {
+      const settings = await database.observerSettings();
+      const name = await database.conversationName(workspaceId, channelId);
+      if (conversationNameMatchesFilter(name, parseFilterTerms(settings.conversationNameFilterTerms))) {
+        throw new Error(`"${name}" matches the coverage name filter, so history recovery must stay turned off`);
+      }
+      await database.setObservationTargetEnabled(workspaceId, channelId, true);
+      runtime.scheduleMetadata(workspaceId, channelId);
+    } else {
+      await database.setObservationTargetEnabled(workspaceId, channelId, false);
+      // Turning coverage off is a cleanup point: no local trace of the conversation remains for agents to digest.
+      await database.purgeConversationData(workspaceId, channelId);
+    }
     response.status(204).end();
   } catch (error) { next(error); }
 });
 app.post("/dashboard/conversations/discover", async (_request, response, next) => {
-  try { response.json(await runtime.discoverConversations()); } catch (error) { next(error); }
+  try {
+    const discovered = await runtime.discoverConversations();
+    const settings = await database.observerSettings();
+    const filteredOffNames = await database.disableFilteredConversations(settings.conversationNameFilterTerms);
+    response.json({ ...discovered, filteredOffNames });
+  } catch (error) { next(error); }
 });
 app.post("/dashboard/backfill/initial", async (_request, response, next) => {
   try {

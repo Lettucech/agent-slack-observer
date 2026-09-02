@@ -13,6 +13,7 @@ test("dashboard settings disclose configuration state without returning secrets"
     rawEventRetentionDays: 7,
     backfillRequestIntervalSeconds: 60,
     downtimeSuggestionSeconds: 300,
+    conversationNameFilterTerms: "on-off-notification",
   });
   assert.deepEqual(settings, {
     configured: true,
@@ -25,6 +26,7 @@ test("dashboard settings disclose configuration state without returning secrets"
     rawEventRetentionDays: 7,
     backfillRequestIntervalSeconds: 60,
     downtimeSuggestionSeconds: 300,
+    conversationNameFilterTerms: "on-off-notification",
   });
   assert.doesNotMatch(JSON.stringify(settings), /secret/);
 });
@@ -57,4 +59,24 @@ test("settings retain only the selected Slack read token", () => {
   assert.equal(userSelection.slackUserToken, "xoxp-new");
   assert.equal(userSelection.slackBotToken, undefined);
   assert.throws(() => settingsFromInput(existing, { slackReadTokenType: "invalid" }), /Choose a Slack User or Bot Token/);
+});
+
+test("coverage name filter saves cleared values instead of keeping the previous terms", () => {
+  const existing = {
+    slackAppToken: "xapp-secret", slackUserToken: "xoxp-secret", slackBotToken: undefined, mcpAuthToken: "mcp-secret",
+    threadSettleSeconds: 90, messageRetentionDays: 30, rawEventRetentionDays: 7, backfillRequestIntervalSeconds: 60, downtimeSuggestionSeconds: 300,
+    conversationNameFilterTerms: " on-off-notification , ops-noise ",
+  };
+
+  const updated = settingsFromInput(existing, { slackReadTokenType: "user", conversationNameFilterTerms: " on-call-updates " });
+  assert.equal(updated.conversationNameFilterTerms, "on-call-updates");
+
+  const cleared = settingsFromInput(existing, { slackReadTokenType: "user", conversationNameFilterTerms: "" });
+  assert.equal(cleared.conversationNameFilterTerms, "");
+
+  const omitted = settingsFromInput(existing, { slackReadTokenType: "user" });
+  assert.equal(omitted.conversationNameFilterTerms, "on-off-notification , ops-noise");
+
+  const defaulted = validateSettingsInput({ slackAppToken: "xapp-token", slackUserToken: "xoxp-token" });
+  assert.equal(defaulted.conversationNameFilterTerms, "");
 });
