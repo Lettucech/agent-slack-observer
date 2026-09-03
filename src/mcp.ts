@@ -1,7 +1,7 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import type { NextFunction, Request, Response } from "express";
-import { createHmac, timingSafeEqual } from "node:crypto";
+import { createHash, createHmac, randomUUID, timingSafeEqual } from "node:crypto";
 import { z } from "zod";
 import type { Database } from "./db.js";
 import { makeDigestBatch, makeMessageDigestSegment } from "./digest.js";
@@ -73,7 +73,7 @@ export function createMcpTransport(database: Database, defaultSettleSeconds: num
       if (!message) throw new Error("Message is no longer retained by this observer");
       const segment = makeMessageDigestSegment(message, maxBytes, afterTextOffset);
       const delivered = segment.textContinues === undefined
-        ? { message: segment, ackToken: signReceipt({ consumerId, eventIds: [message.eventId], expiresAt: Date.now() + RECEIPT_TTL_MS }, receiptSecret) }
+        ? { message: segment, ackToken: signReceipt({ id: randomUUID(), consumerId, eventIds: [message.eventId], expiresAt: Date.now() + RECEIPT_TTL_MS }, receiptSecret) }
         : { message: segment };
       return { content: [{ type: "text", text: JSON.stringify(delivered) }], structuredContent: delivered };
     },
@@ -83,9 +83,14 @@ export function createMcpTransport(database: Database, defaultSettleSeconds: num
     "ack_digest",
     {
       title: "Acknowledge successfully digested Slack events",
-      description: "Acknowledge one successfully digested delivery receipt. Pass the exact ackToken returned with a complete digest group. This never alters Slack, deletes retained messages, or affects another consumer.",
+      description: "Acknowledge one successfully digested delivery receipt. Pass the exact ackToken returned with a complete digest group. Optionally report the agent's measured token usage and elapsed time for the dashboard. This never alters Slack, deletes retained messages, or affects another consumer.",
       inputSchema: {
         ackToken: z.string().min(1),
+        usage: z.object({
+          inputTokens: z.number().int().min(0).max(10_000_000).describe("Agent-reported input tokens used to digest this receipt."),
+          outputTokens: z.number().int().min(0).max(10_000_000).describe("Agent-reported output tokens used to digest this receipt."),
+          durationMs: z.number().int().min(0).max(86_400_000).describe("Agent-reported elapsed processing time in milliseconds."),
+        }).optional(),
         checkpoint: z.object({
           decisions: z.array(z.object({ text: z.string().min(1).max(500), sourceMessageTs: slackTimestamp, owner: z.string().max(200).optional(), deadline: z.string().max(200).optional() })).max(12).optional(),
           actions: z.array(z.object({ text: z.string().min(1).max(500), sourceMessageTs: slackTimestamp, owner: z.string().max(200).optional(), deadline: z.string().max(200).optional() })).max(12).optional(),
@@ -95,11 +100,15 @@ export function createMcpTransport(database: Database, defaultSettleSeconds: num
         }).optional(),
       },
     },
-    async ({ ackToken, checkpoint }) => {
+    async ({ ackToken, usage, checkpoint }) => {
       const receipt = readReceipt(ackToken, receiptSecret);
       const result = checkpoint && receipt.thread
-        ? await database.acknowledgeMessagesAndSaveCheckpoint(receipt.consumerId, receipt.eventIds, receipt.thread.workspaceId, receipt.thread.channelId, receipt.thread.threadTs, receipt.thread.coveredThroughTs, checkpoint)
-        : await database.acknowledgeMessages(receipt.consumerId, receipt.eventIds);
+        ? usage
+          ? await database.acknowledgeMessagesAndSaveCheckpointAndRecordConsumption(receipt.consumerId, receipt.eventIds, receipt.id, usage, receipt.thread.workspaceId, receipt.thread.channelId, receipt.thread.threadTs, receipt.thread.coveredThroughTs, checkpoint)
+          : await database.acknowledgeMessagesAndSaveCheckpoint(receipt.consumerId, receipt.eventIds, receipt.thread.workspaceId, receipt.thread.channelId, receipt.thread.threadTs, receipt.thread.coveredThroughTs, checkpoint)
+        : usage
+          ? await database.acknowledgeMessagesAndRecordConsumption(receipt.consumerId, receipt.eventIds, receipt.id, usage)
+          : await database.acknowledgeMessages(receipt.consumerId, receipt.eventIds);
       const delivered = { acknowledgedCount: result.acknowledgedEventIds.length, alreadyAcknowledgedCount: result.alreadyAcknowledgedEventIds.length, unknownCount: result.unknownEventIds.length };
       return { content: [{ type: "text", text: JSON.stringify(delivered) }], structuredContent: delivered };
     },
@@ -162,14 +171,14 @@ export function createMcpTransport(database: Database, defaultSettleSeconds: num
 }
 
 const RECEIPT_TTL_MS = 7 * 24 * 60 * 60 * 1000;
-type Receipt = { consumerId: string; eventIds: string[]; expiresAt: number; thread?: { workspaceId: string; channelId: string; threadTs: string; coveredThroughTs: string } };
+type Receipt = { id: string; consumerId: string; eventIds: string[]; expiresAt: number; thread?: { workspaceId: string; channelId: string; threadTs: string; coveredThroughTs: string } };
 function addAckTokens(batch: ReturnType<typeof makeDigestBatch>, consumerId: string, eligibleEventIds: Set<string>, secret: string, sourceMessages: import("./types.js").StoredMessage[]) {
   const eventIdByTimestamp = new Map(sourceMessages.map((message) => [`${message.workspaceId}:${message.channelId}:${message.messageTs}`, message.eventId]));
   return { ...batch, groups: batch.groups.map((group) => {
     if (group.threadContinues || group.messages.some((message) => message.textContinues !== undefined)) return group;
     const eventIds = group.messages.map((message) => eventIdByTimestamp.get(`${group.workspaceId}:${group.channelId}:${message.messageTs}`)).filter((eventId): eventId is string => Boolean(eventId && eligibleEventIds.has(eventId)));
     const thread = group.threadTs ? { workspaceId: group.workspaceId, channelId: group.channelId, threadTs: group.threadTs, coveredThroughTs: group.messages.at(-1)!.messageTs } : undefined;
-    return eventIds.length ? { ...group, ackToken: signReceipt({ consumerId, eventIds: [...new Set(eventIds)], expiresAt: Date.now() + RECEIPT_TTL_MS, ...(thread ? { thread } : {}) }, secret) } : group;
+    return eventIds.length ? { ...group, ackToken: signReceipt({ id: randomUUID(), consumerId, eventIds: [...new Set(eventIds)], expiresAt: Date.now() + RECEIPT_TTL_MS, ...(thread ? { thread } : {}) }, secret) } : group;
   }) };
 }
 function signReceipt(receipt: Receipt, secret: string): string {
@@ -188,7 +197,7 @@ function readReceipt(token: string, secret: string): Receipt {
   if (typeof item.consumerId !== "string" || !Array.isArray(item.eventIds) || !item.eventIds.every((id) => typeof id === "string") || typeof item.expiresAt !== "number" || item.expiresAt < Date.now()) throw new Error("Acknowledgement receipt expired or invalid");
   const thread = item.thread;
   if (thread && (typeof thread !== "object" || typeof thread.workspaceId !== "string" || typeof thread.channelId !== "string" || typeof thread.threadTs !== "string" || typeof thread.coveredThroughTs !== "string")) throw new Error("Invalid acknowledgement receipt");
-  return { consumerId: item.consumerId, eventIds: item.eventIds, expiresAt: item.expiresAt, ...(thread ? { thread } : {}) };
+  return { id: typeof item.id === "string" ? item.id : createHash("sha256").update(token).digest("hex"), consumerId: item.consumerId, eventIds: item.eventIds, expiresAt: item.expiresAt, ...(thread ? { thread } : {}) };
 }
 
 type McpTransportFactory = typeof createMcpTransport;

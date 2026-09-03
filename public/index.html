@@ -41,8 +41,9 @@
         </section>
 
         <section class="view" data-view-panel="agents" hidden>
-          <header class="view-header"><div><p class="section-kicker">Delivery</p><h1>Agents</h1></div><p>Each agent only acknowledges its own local delivery receipt.</p></header>
-          <section class="panel"><h2>Consumption</h2><div class="table-wrap"><table><thead><tr><th>Consumer</th><th>Consumed</th><th>Remaining</th><th>Progress</th><th>Last acknowledged</th></tr></thead><tbody id="consumer-progress"></tbody></table></div></section>
+          <header class="view-header"><div><p class="section-kicker">Delivery</p><h1>Agents</h1></div><p>Each agent only acknowledges its own local delivery receipt. Token and duration figures are reported by that agent.</p></header>
+          <section class="panel"><div class="panel-heading"><div><p class="section-kicker">Summary</p><h2>Consumption</h2></div><p class="compact-copy">Usage is optional and agent-reported; Observer does not estimate provider tokens.</p></div><div class="table-wrap"><table><thead><tr><th>Consumer</th><th>Consumed</th><th>Tokens (in / out / total)</th><th>Average time</th><th>Remaining</th><th>Progress</th><th>Last activity</th></tr></thead><tbody id="consumer-progress"></tbody></table></div></section>
+          <section class="panel"><div class="panel-heading"><div><p class="section-kicker">Audit trail</p><h2>Recent consumption records</h2></div><p class="compact-copy">Latest 50 successful acknowledgements that included agent-reported usage.</p></div><div class="table-wrap"><table><thead><tr><th>Consumer</th><th>Messages</th><th>Input tokens</th><th>Output tokens</th><th>Total tokens</th><th>Duration</th><th>Acknowledged</th></tr></thead><tbody id="consumer-consumption-records"></tbody></table></div></section>
           <section class="panel endpoint-card"><p class="section-kicker">Streamable HTTP</p><h2>Agent endpoint</h2><div class="endpoint"><code id="mcp-url"></code><button id="copy-mcp-url" class="secondary tiny" type="button">Copy URL</button></div><p id="endpoint-status" class="form-status" aria-live="polite">MCP tokens are shown only when created or rotated.</p></section>
         </section>
       </main>

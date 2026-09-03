@@ -64,6 +64,8 @@ function channelRow(channel) {
 function time(value) { return value ? new Date(value).toLocaleString() : "Never"; }
 function shortTime(value) { return value ? new Date(value).toLocaleString() : "None yet"; }
 function progressPercent(acknowledged, total) { return total ? Math.round((acknowledged / total) * 100) : 0; }
+function tokenCount(value) { return new Intl.NumberFormat().format(value); }
+function duration(value) { return value < 1000 ? `${value} ms` : `${(value / 1000).toFixed(value % 1000 ? 1 : 0)} s`; }
 function datetimeInput(date) { const offset = date.getTimezoneOffset() * 60_000; return new Date(date.getTime() - offset).toISOString().slice(0, 16); }
 function resetCountdown() { nextRefreshAt = Date.now() + refreshIntervalSeconds * 1000; }
 function updateRefreshStatus() { if (!refreshInFlight) $("#refresh-status").textContent = `Updates in ${Math.max(0, Math.ceil((nextRefreshAt - Date.now()) / 1000))}s`; }
@@ -165,7 +167,13 @@ function renderDashboardData(status, channels, jobs) {
   $("#off-count").textContent = String(offChannels.length);
   $("#off-channels").innerHTML = offChannels.map(channelRow).join("");
   $("#cleanup-off-conversations").disabled = !offChannels.length;
-  $("#consumer-progress").innerHTML = status.consumers.length ? status.consumers.map((consumer) => { const progress = progressPercent(consumer.acknowledgedMessages, consumer.totalMessages); return `<tr><td><code>${escapeHtml(consumer.consumerId)}</code></td><td>${consumer.acknowledgedMessages} / ${consumer.totalMessages}</td><td>${consumer.pendingMessages}</td><td><div class=\"progress\" aria-label=\"${progress}% consumed\"><span style=\"width:${progress}%\"></span></div><small>${progress}%</small></td><td>${time(consumer.lastAcknowledgedAt)}</td></tr>`; }).join("") : "<tr><td colspan=\"5\" class=\"form-status\">No agent acknowledgement yet.</td></tr>";
+  $("#consumer-progress").innerHTML = status.consumers.length ? status.consumers.map((consumer) => {
+    const progress = progressPercent(consumer.acknowledgedMessages, consumer.totalMessages);
+    const averageDuration = consumer.reportedRuns ? duration(Math.round(consumer.totalDurationMs / consumer.reportedRuns)) : "—";
+    const usage = consumer.reportedRuns ? `${tokenCount(consumer.inputTokens)} / ${tokenCount(consumer.outputTokens)} / ${tokenCount(consumer.totalTokens)}` : "—";
+    return `<tr><td><code>${escapeHtml(consumer.consumerId)}</code></td><td>${consumer.acknowledgedMessages} / ${consumer.totalMessages}</td><td>${usage}</td><td>${averageDuration}</td><td>${consumer.pendingMessages}</td><td><div class=\"progress\" aria-label=\"${progress}% consumed\"><span style=\"width:${progress}%\"></span></div><small>${progress}%</small></td><td>${time(consumer.lastConsumedAt ?? consumer.lastAcknowledgedAt)}</td></tr>`;
+  }).join("") : "<tr><td colspan=\"7\" class=\"form-status\">No agent acknowledgement yet.</td></tr>";
+  $("#consumer-consumption-records").innerHTML = status.consumptionRecords.length ? status.consumptionRecords.map((record) => `<tr><td><code>${escapeHtml(record.consumerId)}</code></td><td>${record.acknowledgedMessages}</td><td>${tokenCount(record.inputTokens)}</td><td>${tokenCount(record.outputTokens)}</td><td>${tokenCount(record.totalTokens)}</td><td>${duration(record.durationMs)}</td><td>${time(record.acknowledgedAt)}</td></tr>`).join("") : "<tr><td colspan=\"7\" class=\"form-status\">No agent-reported consumption records yet.</td></tr>";
   $("#backfill-jobs").innerHTML = jobs.length ? jobs.map((job) => `<tr><td>#${job.id} · ${jobLabel(job.kind)}</td><td>${time(job.requestedStartAt)}<br>to ${time(job.requestedEndAt)}</td><td>${job.completedTasks}/${job.totalTasks} tasks<br><small>${job.channels} conversations · ${job.replyTasks} reply checks</small></td><td>${escapeHtml(job.state)}</td><td>${job.lastError ? `<span class=\"error\">${escapeHtml(job.lastError)}</span>` : ""}${["queued", "running"].includes(job.state) ? `<button class=\"secondary tiny\" data-cancel-job=\"${job.id}\" type=\"button\">Cancel</button>` : ""}</td></tr>`).join("") : "<tr><td colspan=\"5\" class=\"form-status\">No recovery jobs yet.</td></tr>";
   $("#backfill-status").textContent = status.nextBackfillRequestAt && new Date(status.nextBackfillRequestAt) > new Date() ? `Next Slack request: ${time(status.nextBackfillRequestAt)}.` : "Queue is ready for its next Slack request.";
 }

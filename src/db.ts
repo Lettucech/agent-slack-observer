@@ -9,7 +9,9 @@ export type SlackEnvelope = { event_id?: unknown; team_id?: unknown; api_app_id?
 export type SlackHistoryMessage = Record<string, unknown> & { ts: string; type?: string; thread_ts?: string; reply_count?: number; latest_reply?: string };
 export type BackfillTask = { id: number; jobId: number; workspaceId: string; channelId: string; phase: "history" | "replies"; cursor: string | null; rootTs: string | null; oldest: string; latest: string; attempts: number };
 export type BackfillJob = { id: number; kind: "initial" | "manual" | "downtime"; state: string; requestedStartAt: string; requestedEndAt: string; createdAt: string; completedAt: string | null; channels: number; completedTasks: number; totalTasks: number; historyTasks: number; replyTasks: number; lastError: string | null };
-export type ConsumerProgress = { consumerId: string; totalMessages: number; acknowledgedMessages: number; pendingMessages: number; lastAcknowledgedAt: string | null };
+export type ConsumerUsage = { inputTokens: number; outputTokens: number; durationMs: number };
+export type ConsumerProgress = { consumerId: string; totalMessages: number; acknowledgedMessages: number; pendingMessages: number; lastAcknowledgedAt: string | null; reportedRuns: number; inputTokens: number; outputTokens: number; totalTokens: number; totalDurationMs: number; lastConsumedAt: string | null };
+export type ConsumerConsumptionRecord = { consumerId: string; acknowledgedMessages: number; inputTokens: number; outputTokens: number; totalTokens: number; durationMs: number; acknowledgedAt: string };
 
 export class Database {
   readonly pool: Pool;
@@ -37,6 +39,12 @@ export class Database {
         PRIMARY KEY (consumer_id, event_id)
       );
       CREATE INDEX IF NOT EXISTS consumer_message_acks_event_idx ON consumer_message_acks (event_id);
+      CREATE TABLE IF NOT EXISTS consumer_consumption_records (
+        receipt_id TEXT PRIMARY KEY, consumer_id TEXT NOT NULL, acknowledged_messages INTEGER NOT NULL CHECK (acknowledged_messages >= 0),
+        input_tokens INTEGER NOT NULL CHECK (input_tokens >= 0), output_tokens INTEGER NOT NULL CHECK (output_tokens >= 0),
+        duration_ms BIGINT NOT NULL CHECK (duration_ms >= 0), acknowledged_at TIMESTAMPTZ NOT NULL DEFAULT now()
+      );
+      CREATE INDEX IF NOT EXISTS consumer_consumption_records_consumer_acknowledged_idx ON consumer_consumption_records (consumer_id, acknowledged_at DESC);
       CREATE TABLE IF NOT EXISTS consumer_thread_checkpoints (
         consumer_id TEXT NOT NULL, workspace_id TEXT NOT NULL, channel_id TEXT NOT NULL, thread_ts TEXT NOT NULL,
         covered_through_ts TEXT NOT NULL, checkpoint JSONB NOT NULL, updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
@@ -413,6 +421,16 @@ export class Database {
       unknownEventIds: result.rows.filter((row) => !row.is_known).map((row) => row.event_id),
     };
   }
+  async acknowledgeMessagesAndRecordConsumption(consumerId: string, eventIds: string[], receiptId: string, usage: ConsumerUsage): Promise<{ acknowledgedEventIds: string[]; alreadyAcknowledgedEventIds: string[]; unknownEventIds: string[] }> {
+    const client = await this.pool.connect();
+    try {
+      await client.query("BEGIN");
+      const result = await acknowledgeWithClient(client, consumerId, eventIds);
+      await saveConsumptionRecord(client, receiptId, consumerId, result.acknowledgedEventIds.length, usage);
+      await client.query("COMMIT");
+      return result;
+    } catch (error) { await client.query("ROLLBACK"); throw error; } finally { client.release(); }
+  }
   async saveThreadCheckpoint(consumerId: string, workspaceId: string, channelId: string, threadTs: string, coveredThroughTs: string, checkpoint: ThreadCheckpoint): Promise<void> {
     await this.pool.query(`INSERT INTO consumer_thread_checkpoints (consumer_id, workspace_id, channel_id, thread_ts, covered_through_ts, checkpoint)
       VALUES ($1, $2, $3, $4, $5, $6) ON CONFLICT (consumer_id, workspace_id, channel_id, thread_ts) DO UPDATE
@@ -433,6 +451,19 @@ export class Database {
         SET covered_through_ts = EXCLUDED.covered_through_ts, checkpoint = EXCLUDED.checkpoint, updated_at = now()`, [consumerId, workspaceId, channelId, threadTs, coveredThroughTs, checkpoint]);
       await client.query("COMMIT");
       return { acknowledgedEventIds: result.rows.filter((row) => row.inserted).map((row) => row.event_id), alreadyAcknowledgedEventIds: result.rows.filter((row) => row.is_known && !row.inserted).map((row) => row.event_id), unknownEventIds: result.rows.filter((row) => !row.is_known).map((row) => row.event_id) };
+    } catch (error) { await client.query("ROLLBACK"); throw error; } finally { client.release(); }
+  }
+  async acknowledgeMessagesAndSaveCheckpointAndRecordConsumption(consumerId: string, eventIds: string[], receiptId: string, usage: ConsumerUsage, workspaceId: string, channelId: string, threadTs: string, coveredThroughTs: string, checkpoint: ThreadCheckpoint): Promise<{ acknowledgedEventIds: string[]; alreadyAcknowledgedEventIds: string[]; unknownEventIds: string[] }> {
+    const client = await this.pool.connect();
+    try {
+      await client.query("BEGIN");
+      const result = await acknowledgeWithClient(client, consumerId, eventIds);
+      await client.query(`INSERT INTO consumer_thread_checkpoints (consumer_id, workspace_id, channel_id, thread_ts, covered_through_ts, checkpoint)
+        VALUES ($1, $2, $3, $4, $5, $6) ON CONFLICT (consumer_id, workspace_id, channel_id, thread_ts) DO UPDATE
+        SET covered_through_ts = EXCLUDED.covered_through_ts, checkpoint = EXCLUDED.checkpoint, updated_at = now()`, [consumerId, workspaceId, channelId, threadTs, coveredThroughTs, checkpoint]);
+      await saveConsumptionRecord(client, receiptId, consumerId, result.acknowledgedEventIds.length, usage);
+      await client.query("COMMIT");
+      return result;
     } catch (error) { await client.query("ROLLBACK"); throw error; } finally { client.release(); }
   }
   async threadCheckpoints(consumerId: string, messages: StoredMessage[]): Promise<Map<string, ThreadCheckpoint>> {
@@ -496,20 +527,25 @@ export class Database {
       FROM backfill_jobs j LEFT JOIN backfill_tasks t ON t.job_id = j.id GROUP BY j.id ORDER BY j.id DESC LIMIT 20`);
     return result.rows.map(toJob);
   }
-  async dashboardStatus(): Promise<{ events: number; messages: number; lastReceivedAt: string | null; channels: number; earliestMessageAt: string | null; nextBackfillRequestAt: string | null; consumers: ConsumerProgress[] }> {
+  async dashboardStatus(): Promise<{ events: number; messages: number; lastReceivedAt: string | null; channels: number; earliestMessageAt: string | null; nextBackfillRequestAt: string | null; consumers: ConsumerProgress[]; consumptionRecords: ConsumerConsumptionRecord[] }> {
     const result = await this.pool.query<{ events: string; messages: string; last_received_at: string | null; channels: string; earliest_message_at: string | null; next_request_at: string | null }>(
       `SELECT (SELECT count(*) FROM slack_events)::text AS events, (SELECT count(*) FROM messages)::text AS messages,
        (SELECT max(received_at)::text FROM slack_events) AS last_received_at, (SELECT count(*) FROM observation_targets WHERE enabled)::text AS channels,
        (SELECT min(to_timestamp(message_ts::double precision))::text FROM messages) AS earliest_message_at,
        (SELECT next_request_at::text FROM backfill_runtime WHERE singleton) AS next_request_at`);
-    const consumers = await this.pool.query<{ consumer_id: string; total_messages: string; acknowledged_messages: string; pending_messages: string; last_acknowledged_at: string | null }>(
-      `WITH consumers AS (SELECT DISTINCT consumer_id FROM consumer_message_acks)
+    const consumers = await this.pool.query<{ consumer_id: string; total_messages: string; acknowledged_messages: string; pending_messages: string; last_acknowledged_at: string | null; reported_runs: string; input_tokens: string; output_tokens: string; total_duration_ms: string; last_consumed_at: string | null }>(
+      `WITH consumers AS (SELECT DISTINCT consumer_id FROM consumer_message_acks UNION SELECT DISTINCT consumer_id FROM consumer_consumption_records),
+       usage AS (SELECT consumer_id, count(*)::text AS reported_runs, coalesce(sum(input_tokens), 0)::text AS input_tokens, coalesce(sum(output_tokens), 0)::text AS output_tokens, coalesce(sum(duration_ms), 0)::text AS total_duration_ms, max(acknowledged_at)::text AS last_consumed_at FROM consumer_consumption_records GROUP BY consumer_id)
        SELECT c.consumer_id, count(m.event_id)::text AS total_messages, count(a.event_id)::text AS acknowledged_messages,
-         (count(m.event_id) - count(a.event_id))::text AS pending_messages, max(a.acknowledged_at)::text AS last_acknowledged_at
-       FROM consumers c CROSS JOIN messages m
+         (count(m.event_id) - count(a.event_id))::text AS pending_messages, max(a.acknowledged_at)::text AS last_acknowledged_at,
+         coalesce(u.reported_runs, '0') AS reported_runs, coalesce(u.input_tokens, '0') AS input_tokens, coalesce(u.output_tokens, '0') AS output_tokens, coalesce(u.total_duration_ms, '0') AS total_duration_ms, u.last_consumed_at
+       FROM consumers c LEFT JOIN messages m ON true
        LEFT JOIN consumer_message_acks a ON a.consumer_id = c.consumer_id AND a.event_id = m.event_id
-       GROUP BY c.consumer_id ORDER BY max(a.acknowledged_at) DESC NULLS LAST, c.consumer_id`);
-    const row = result.rows[0]; return { events: Number(row.events), messages: Number(row.messages), lastReceivedAt: row.last_received_at, channels: Number(row.channels), earliestMessageAt: row.earliest_message_at, nextBackfillRequestAt: row.next_request_at, consumers: consumers.rows.map(toConsumerProgress) };
+       LEFT JOIN usage u ON u.consumer_id = c.consumer_id
+       GROUP BY c.consumer_id, u.reported_runs, u.input_tokens, u.output_tokens, u.total_duration_ms, u.last_consumed_at ORDER BY max(a.acknowledged_at) DESC NULLS LAST, u.last_consumed_at DESC NULLS LAST, c.consumer_id`);
+    const consumptionRecords = await this.pool.query<{ consumer_id: string; acknowledged_messages: string; input_tokens: string; output_tokens: string; duration_ms: string; acknowledged_at: string }>(
+      `SELECT consumer_id, acknowledged_messages::text, input_tokens::text, output_tokens::text, duration_ms::text, acknowledged_at::text FROM consumer_consumption_records ORDER BY acknowledged_at DESC LIMIT 50`);
+    const row = result.rows[0]; return { events: Number(row.events), messages: Number(row.messages), lastReceivedAt: row.last_received_at, channels: Number(row.channels), earliestMessageAt: row.earliest_message_at, nextBackfillRequestAt: row.next_request_at, consumers: consumers.rows.map(toConsumerProgress), consumptionRecords: consumptionRecords.rows.map(toConsumerConsumptionRecord) };
   }
   async observerSettings(): Promise<ObserverSettings> {
     const result = await this.pool.query<SettingsRow>(`SELECT slack_app_token, slack_user_token, slack_bot_token, mcp_auth_token, thread_settle_seconds, message_retention_days, raw_event_retention_days, backfill_request_interval_seconds, downtime_suggestion_seconds, conversation_name_filter_terms FROM observer_settings WHERE singleton`);
@@ -560,7 +596,27 @@ type ChannelRow = { workspace_id: string; workspace_name: string | null; channel
 type JobRow = { id: string; kind: "initial" | "manual" | "downtime"; state: string; requested_start_at: string; requested_end_at: string; created_at: string; completed_at: string | null; last_error: string | null; channels: string; completed_tasks: string; total_tasks: string; history_tasks: string; reply_tasks: string };
 type SettingsRow = { slack_app_token: string | null; slack_user_token: string | null; slack_bot_token: string | null; mcp_auth_token: string | null; thread_settle_seconds: number; message_retention_days: number; raw_event_retention_days: number; backfill_request_interval_seconds: number; downtime_suggestion_seconds: number; conversation_name_filter_terms: string };
 function toStoredMessage(row: MessageRow): StoredMessage { return { eventId: row.event_id, eventSequence: Number(row.event_sequence), workspaceId: row.workspace_id, channelId: row.channel_id, conversationType: conversationTypeFromStoredValue(row.conversation_type), messageTs: row.message_ts, threadTs: row.thread_ts, userId: row.user_id, subtype: row.subtype, text: row.text, payload: row.event_payload, observedAt: row.observed_at, workspaceName: row.workspace_name, channelName: row.channel_name }; }
-export function toConsumerProgress(row: { consumer_id: string; total_messages: string; acknowledged_messages: string; pending_messages: string; last_acknowledged_at: string | null }): ConsumerProgress { return { consumerId: row.consumer_id, totalMessages: Number(row.total_messages), acknowledgedMessages: Number(row.acknowledged_messages), pendingMessages: Number(row.pending_messages), lastAcknowledgedAt: row.last_acknowledged_at }; }
+export function toConsumerProgress(row: { consumer_id: string; total_messages: string; acknowledged_messages: string; pending_messages: string; last_acknowledged_at: string | null; reported_runs: string; input_tokens: string; output_tokens: string; total_duration_ms: string; last_consumed_at: string | null }): ConsumerProgress {
+  const inputTokens = Number(row.input_tokens); const outputTokens = Number(row.output_tokens);
+  return { consumerId: row.consumer_id, totalMessages: Number(row.total_messages), acknowledgedMessages: Number(row.acknowledged_messages), pendingMessages: Number(row.pending_messages), lastAcknowledgedAt: row.last_acknowledged_at, reportedRuns: Number(row.reported_runs), inputTokens, outputTokens, totalTokens: inputTokens + outputTokens, totalDurationMs: Number(row.total_duration_ms), lastConsumedAt: row.last_consumed_at };
+}
+export function toConsumerConsumptionRecord(row: { consumer_id: string; acknowledged_messages: string; input_tokens: string; output_tokens: string; duration_ms: string; acknowledged_at: string }): ConsumerConsumptionRecord {
+  const inputTokens = Number(row.input_tokens); const outputTokens = Number(row.output_tokens);
+  return { consumerId: row.consumer_id, acknowledgedMessages: Number(row.acknowledged_messages), inputTokens, outputTokens, totalTokens: inputTokens + outputTokens, durationMs: Number(row.duration_ms), acknowledgedAt: row.acknowledged_at };
+}
+async function acknowledgeWithClient(client: PoolClient, consumerId: string, eventIds: string[]): Promise<{ acknowledgedEventIds: string[]; alreadyAcknowledgedEventIds: string[]; unknownEventIds: string[] }> {
+  const uniqueEventIds = [...new Set(eventIds)];
+  const result = await client.query<{ event_id: string; is_known: boolean; inserted: boolean }>(
+    `WITH input AS (SELECT DISTINCT unnest($2::text[]) AS event_id), known AS (SELECT input.event_id FROM input JOIN messages m USING (event_id)), inserted AS (
+      INSERT INTO consumer_message_acks (consumer_id, event_id) SELECT $1, event_id FROM known ON CONFLICT DO NOTHING RETURNING event_id
+    ) SELECT input.event_id, EXISTS (SELECT 1 FROM known WHERE known.event_id = input.event_id) AS is_known, EXISTS (SELECT 1 FROM inserted WHERE inserted.event_id = input.event_id) AS inserted FROM input`, [consumerId, uniqueEventIds],
+  );
+  return { acknowledgedEventIds: result.rows.filter((row) => row.inserted).map((row) => row.event_id), alreadyAcknowledgedEventIds: result.rows.filter((row) => row.is_known && !row.inserted).map((row) => row.event_id), unknownEventIds: result.rows.filter((row) => !row.is_known).map((row) => row.event_id) };
+}
+async function saveConsumptionRecord(client: PoolClient, receiptId: string, consumerId: string, acknowledgedMessages: number, usage: ConsumerUsage): Promise<void> {
+  await client.query(`INSERT INTO consumer_consumption_records (receipt_id, consumer_id, acknowledged_messages, input_tokens, output_tokens, duration_ms)
+    VALUES ($1, $2, $3, $4, $5, $6) ON CONFLICT (receipt_id) DO NOTHING`, [receiptId, consumerId, acknowledgedMessages, usage.inputTokens, usage.outputTokens, usage.durationMs]);
+}
 function toTask(row: TaskRow): BackfillTask { return { id: Number(row.id), jobId: Number(row.job_id), workspaceId: row.workspace_id, channelId: row.channel_id, phase: row.phase, cursor: row.cursor, rootTs: row.root_ts, oldest: row.oldest, latest: row.latest, attempts: row.attempts }; }
 function toJob(row: JobRow): BackfillJob { return { id: Number(row.id), kind: row.kind, state: row.state, requestedStartAt: row.requested_start_at, requestedEndAt: row.requested_end_at, createdAt: row.created_at, completedAt: row.completed_at, channels: Number(row.channels), completedTasks: Number(row.completed_tasks), totalTasks: Number(row.total_tasks), historyTasks: Number(row.history_tasks), replyTasks: Number(row.reply_tasks), lastError: row.last_error }; }
 function historyEventId(workspaceId: string, channelId: string, ts: string): string { return `history:${workspaceId}:${channelId}:${ts}`; }

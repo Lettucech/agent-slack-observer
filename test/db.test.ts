@@ -16,9 +16,9 @@ test("keeps a typed cursor bind only when a next history page exists", () => {
   assert.deepEqual(statement.values, [42, "next-page"]);
 });
 
-test("reports acknowledged and pending messages for a consumer", () => {
-  assert.deepEqual(toConsumerProgress({ consumer_id: "hermes-vault-digest", total_messages: "121", acknowledged_messages: "120", pending_messages: "1", last_acknowledged_at: "2026-08-19 01:00:00+00" }), {
-    consumerId: "hermes-vault-digest", totalMessages: 121, acknowledgedMessages: 120, pendingMessages: 1, lastAcknowledgedAt: "2026-08-19 01:00:00+00",
+test("reports acknowledgement and agent-reported usage for a consumer", () => {
+  assert.deepEqual(toConsumerProgress({ consumer_id: "hermes-vault-digest", total_messages: "121", acknowledged_messages: "120", pending_messages: "1", last_acknowledged_at: "2026-08-19 01:00:00+00", reported_runs: "4", input_tokens: "500", output_tokens: "125", total_duration_ms: "8000", last_consumed_at: "2026-08-19 01:02:00+00" }), {
+    consumerId: "hermes-vault-digest", totalMessages: 121, acknowledgedMessages: 120, pendingMessages: 1, lastAcknowledgedAt: "2026-08-19 01:00:00+00", reportedRuns: 4, inputTokens: 500, outputTokens: 125, totalTokens: 625, totalDurationMs: 8000, lastConsumedAt: "2026-08-19 01:02:00+00",
   });
 });
 

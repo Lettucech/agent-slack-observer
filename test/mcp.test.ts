@@ -82,6 +82,44 @@ test("uses a consumer inbox without requiring an agent cursor and acknowledges o
   }
 });
 
+test("records agent-reported token usage with a successful acknowledgement exactly once", async () => {
+  const reports: Array<{ consumerId: string; eventIds: string[]; receiptId: string; usage: { inputTokens: number; outputTokens: number; durationMs: number } }> = [];
+  const reportedReceiptIds = new Set<string>();
+  const message: StoredMessage = { eventId: "Ev-usage", eventSequence: 1, workspaceId: "T1", channelId: "C1", conversationType: "private_channel", messageTs: "1001.0", threadTs: null, userId: "U1", subtype: null, text: "usage", payload: {}, observedAt: "2026-08-13T00:00:00Z" };
+  const database = {
+    latestSequence: async () => 1,
+    pendingMessages: async () => [message],
+    hydrateThreads: async (items: StoredMessage[]) => items,
+    acknowledgeMessagesAndRecordConsumption: async (consumerId: string, eventIds: string[], receiptId: string, usage: { inputTokens: number; outputTokens: number; durationMs: number }) => {
+      if (reportedReceiptIds.has(receiptId)) return { acknowledgedEventIds: [], alreadyAcknowledgedEventIds: eventIds, unknownEventIds: [] };
+      reportedReceiptIds.add(receiptId);
+      reports.push({ consumerId, eventIds, receiptId, usage });
+      return { acknowledgedEventIds: eventIds, alreadyAcknowledgedEventIds: [], unknownEventIds: [] };
+    },
+  } as unknown as Database;
+  const { server } = createMcpTransport(database, 90);
+  const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+  const client = new Client({ name: "test-client", version: "1.0.0" });
+  await server.connect(serverTransport);
+  await client.connect(clientTransport);
+  try {
+    const digest = await client.callTool({ name: "get_digest_batches", arguments: { consumerId: "hermes", maxBytes: 1000 } });
+    const ackToken = (digest.structuredContent as { groups: Array<{ ackToken: string }> }).groups[0].ackToken;
+    const ack = await client.callTool({ name: "ack_digest", arguments: { ackToken, usage: { inputTokens: 120, outputTokens: 30, durationMs: 1_250 } } });
+    assert.deepEqual(ack.structuredContent, { acknowledgedCount: 1, alreadyAcknowledgedCount: 0, unknownCount: 0 });
+    const retry = await client.callTool({ name: "ack_digest", arguments: { ackToken, usage: { inputTokens: 120, outputTokens: 30, durationMs: 1_250 } } });
+    assert.deepEqual(retry.structuredContent, { acknowledgedCount: 0, alreadyAcknowledgedCount: 1, unknownCount: 0 });
+    assert.equal(reports.length, 1);
+    assert.equal(reports[0].consumerId, "hermes");
+    assert.deepEqual(reports[0].eventIds, ["Ev-usage"]);
+    assert.match(reports[0].receiptId, /^[0-9a-f-]{36}$/);
+    assert.deepEqual(reports[0].usage, { inputTokens: 120, outputTokens: 30, durationMs: 1_250 });
+  } finally {
+    await client.close();
+    await server.close();
+  }
+});
+
 test("continues an oversized message without dropping text", async () => {
   const oversized: StoredMessage = { eventId: "Ev-large", eventSequence: 1, workspaceId: "T1", channelId: "C1", conversationType: "unknown", messageTs: "1000.0", threadTs: null, userId: "U1", subtype: null, text: "x".repeat(500), payload: { blocks: "ignored" }, observedAt: "2026-08-13T00:00:00Z" };
   const database = { getMessage: async () => oversized } as unknown as Database;
