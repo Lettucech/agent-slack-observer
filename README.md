@@ -10,6 +10,8 @@ The observer never uses Slack MCP or posts a reply. It can record a consumer's s
 
 ## Start it
 
+Observer stores its data in the shared PostgreSQL instance from the `agent-infra` repository. Bring that stack up first, create the `observer` database with its `initdb.d` bootstrap or `scripts/new-service-db.sh`, then set `DATABASE_URL` in a local `.env` file (see `.env.example`) on the `agent-infra` Docker network.
+
 1. Start the service:
 
    ```sh
@@ -28,11 +30,11 @@ The observer never uses Slack MCP or posts a reply. It can record a consumer's s
 
 The MCP endpoint is `http://localhost:3000/mcp` and requires the Bearer token generated or rotated in the dashboard.
 
-PostgreSQL is internal to Docker Compose. The observer receives its database connection only from the Compose network; users never need to configure a database URL. Compose binds the dashboard and MCP port to `127.0.0.1` only, so other LAN devices cannot reach it.
+PostgreSQL is not part of this Compose project. The observer receives its database connection only through `DATABASE_URL` and connects to the shared `agent-postgres` container over the `agent-infra` network; it never exposes a database port itself. Compose binds the dashboard and MCP port to `127.0.0.1` only, so other LAN devices cannot reach it.
 
 ## Dashboard-first settings
 
-The dashboard stores Slack credentials, the generated MCP bearer token, and runtime limits in the PostgreSQL volume. It returns only whether each secret is configured; saved values are never sent back to the browser, endpoints, or logs. Updating settings immediately restarts the affected local Socket Mode and backfill workers.
+The dashboard stores Slack credentials, the generated MCP bearer token, and runtime limits in PostgreSQL. It returns only whether each secret is configured; saved values are never sent back to the browser, endpoints, or logs. Updating settings immediately restarts the affected local Socket Mode and backfill workers.
 
 | Dashboard setting | Default | Purpose |
 | --- | --- | --- |
@@ -75,7 +77,7 @@ The observer uses the selected read token for `auth.test`, `team.info`, `convers
 
 The Slack user token is a user OAuth credential, not an app token. Request only these user scopes when the associated conversation types are needed: `channels:read`, `channels:history`, `groups:read`, `groups:history`, `im:read`, `im:history`, `mpim:read`, `mpim:history`, and `users:read` when you want DM participant labels. Finding conversations can include DMs and group DMs, and stores conversation IDs plus names/participant display names as excluded candidates. Message content is fetched only after you include a conversation and either build an index, request an exact window, or an automatic recovery is needed; it remains subject to retention.
 
-Slack tokens are stored in the local PostgreSQL volume so the dashboard can apply them without a process restart. The observer never returns them from dashboard or MCP endpoints, and it does not log them. Revoke a token in Slack to invalidate it; switching the selected read-token type removes the formerly selected token immediately on save.
+Slack tokens are stored in PostgreSQL so the dashboard can apply them without a process restart. The observer never returns them from dashboard or MCP endpoints, and it does not log them. Revoke a token in Slack to invalidate it; switching the selected read-token type removes the formerly selected token immediately on save.
 
 ## What happens on a new message
 
@@ -144,7 +146,7 @@ Example remote MCP configuration shape (adapt this to the agent host's configura
 
 ## Dashboard and security
 
-The dashboard is intentionally unauthenticated for this local-first deployment and Compose binds it to `127.0.0.1`. It shows observer status, target channels, cached workspace/channel names and IDs, backfill controls, and the setup form; it does not return saved Slack tokens or MCP credentials. It can cause read-only Slack conversation-list/history calls, so do not expose it beyond the intended local environment without adding authentication. PostgreSQL stores raw message payloads **and dashboard-configured credentials**; protect the Docker volume, backups, and host account accordingly.
+The dashboard is intentionally unauthenticated for this local-first deployment and Compose binds it to `127.0.0.1`. It shows observer status, target channels, cached workspace/channel names and IDs, backfill controls, and the setup form; it does not return saved Slack tokens or MCP credentials. It can cause read-only Slack conversation-list/history calls, so do not expose it beyond the intended local environment without adding authentication. PostgreSQL stores raw message payloads **and dashboard-configured credentials**; protect the shared database, its backups, and the host account accordingly.
 
 ## Verification
 
