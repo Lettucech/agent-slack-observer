@@ -10,7 +10,7 @@ The observer never uses Slack MCP or posts a reply. It can record a consumer's s
 
 ## Start it
 
-Observer stores its data in the shared PostgreSQL instance from the `agent-infra` repository. Bring that stack up first, create the `observer` database with its `initdb.d` bootstrap or `scripts/new-service-db.sh`, then set `DATABASE_URL` in a local `.env` file (see `.env.example`) on the `agent-infra` Docker network.
+Observer works with any PostgreSQL instance. Point `DATABASE_URL` at it in a local `.env` file (see `.env.example`); the service creates its own tables on first boot. If your database lives on a shared Docker network, add a local `compose.override.yaml` (see below).
 
 1. Start the service:
 
@@ -30,7 +30,23 @@ Observer stores its data in the shared PostgreSQL instance from the `agent-infra
 
 The MCP endpoint is `http://localhost:3000/mcp` and requires the Bearer token generated or rotated in the dashboard.
 
-PostgreSQL is not part of this Compose project. The observer receives its database connection only through `DATABASE_URL` and connects to the shared `agent-postgres` container over the `agent-infra` network; it never exposes a database port itself. Compose binds the dashboard and MCP port to `127.0.0.1` only, so other LAN devices cannot reach it.
+PostgreSQL is not part of this Compose project. The observer receives its database connection only through `DATABASE_URL`, and any reachable Postgres works; it never exposes a database port itself. Compose binds the dashboard and MCP port to `127.0.0.1` only, so other LAN devices cannot reach it.
+
+### Connecting to a database on another Docker network
+
+The base `compose.yaml` is infra-agnostic: it uses its own default network and assumes nothing about where Postgres runs. To join an existing external network — for example a shared infrastructure stack whose services reach each other by network hostname — add a local `compose.override.yaml`, which Compose merges automatically:
+
+```yaml
+services:
+  observer:
+    networks: [my-shared-network]
+
+networks:
+  my-shared-network:
+    external: true
+```
+
+Keep that file local: it is per-deployment glue, not part of the service.
 
 ## Dashboard-first settings
 

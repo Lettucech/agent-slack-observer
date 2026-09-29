@@ -4,10 +4,5 @@ services:
     ports:
       - "127.0.0.1:${PORT:-3000}:3000"
     environment:
-      DATABASE_URL: ${DATABASE_URL:?Set DATABASE_URL in .env (shared Postgres from the agent-infra repo)}
-    networks: [agent-infra]
+      DATABASE_URL: ${DATABASE_URL:?Set DATABASE_URL in .env (any reachable Postgres)}
     restart: unless-stopped
-
-networks:
-  agent-infra:
-    external: true

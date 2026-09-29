@@ -16,7 +16,10 @@ export type ConsumerConsumptionRecord = { consumerId: string; acknowledgedMessag
 export class Database {
   readonly pool: Pool;
 
-  constructor(connectionString: string) { this.pool = new Pool({ connectionString }); }
+  constructor(connectionString: string) {
+    // Cap connections so several services can share one Postgres instance.
+    this.pool = new Pool({ connectionString, max: 5 });
+  }
 
   async migrate(): Promise<void> {
     await this.pool.query(`
