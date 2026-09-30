@@ -24,6 +24,11 @@ let nextRefreshAt = Date.now();
 let refreshInFlight = false;
 let lastSettingsOpener = null;
 let onboardingTokenType = null;
+let latestChannels = [];
+const conversationPageSize = 25;
+const conversationLists = {
+  main: { key: "main", search: $("#channels-search"), pager: $("#channels-pager"), tbody: $("#channels"), query: "", page: 1, filteredCount: 0, emptyMessage: "Find accessible conversations or include one by ID to begin." },
+};
 
 $("#mcp-url").textContent = `${window.location.origin}/mcp`;
 
@@ -59,7 +64,29 @@ function coverageSwitch(channel) {
   return `<button class="coverage-switch is-${state}" data-set-coverage="${enabled ? "false" : "true"}" data-workspace-id="${escapeHtml(channel.workspaceId)}" data-channel-id="${escapeHtml(channel.channelId)}" type="button" role="switch" aria-checked="${enabled}" aria-label="${label}" title="${label}"><span aria-hidden="true"></span><span class="visually-hidden">${label}</span></button>`;
 }
 function channelRow(channel) {
-  return `<tr><td>${formatReference(channel.workspaceName, channel.workspaceId)}</td><td>${formatConversation(channel)}</td><td>${channel.messageCount}</td><td>${time(channel.lastObservedAt)}</td><td>${coverageSwitch(channel)}</td></tr>`;
+  return `<tr${channel.enabled ? "" : ' class="is-off"'}><td>${formatReference(channel.workspaceName, channel.workspaceId)}</td><td>${formatConversation(channel)}</td><td>${channel.messageCount}</td><td>${time(channel.lastObservedAt)}</td><td>${coverageSwitch(channel)}</td></tr>`;
+}
+function conversationMatches(channel, query) {
+  if (!query) return true;
+  return `${conversationTitle(channel)} ${channel.channelId} ${channel.workspaceName ?? ""} ${conversationTypeLabel(channel.conversationType)}`.toLowerCase().includes(query);
+}
+function renderConversationList(list, channels) {
+  const query = list.query.trim().toLowerCase();
+  const filtered = channels.filter((channel) => conversationMatches(channel, query));
+  list.filteredCount = filtered.length;
+  const pageCount = Math.max(1, Math.ceil(filtered.length / conversationPageSize));
+  list.page = Math.min(Math.max(1, list.page), pageCount);
+  const visible = filtered.slice((list.page - 1) * conversationPageSize, list.page * conversationPageSize);
+  list.tbody.innerHTML = visible.length ? visible.map(channelRow).join("") : `<tr><td colspan="5" class="form-status">${query ? "No conversations match this filter." : list.emptyMessage}</td></tr>`;
+  const offCount = query ? 0 : channels.filter((channel) => !channel.enabled).length;
+  const countLabel = `${filtered.length} ${query ? `match${filtered.length === 1 ? "" : "es"}` : `conversation${filtered.length === 1 ? "" : "s"}`}${offCount ? ` · ${offCount} turned off` : ""}`;
+  const pages = pageCount > 1 ? `<button class="secondary tiny" data-pager="${list.key}:prev" type="button" ${list.page <= 1 ? "disabled" : ""}>‹ Prev</button><span class="pager-state">Page ${list.page} of ${pageCount}</span><button class="secondary tiny" data-pager="${list.key}:next" type="button" ${list.page >= pageCount ? "disabled" : ""}>Next ›</button>` : "";
+  list.pager.innerHTML = `<span class="pager-count">${countLabel}</span>${pages}`;
+}
+function renderConversationLists() {
+  const enabled = latestChannels.filter((channel) => channel.enabled);
+  const disabled = latestChannels.filter((channel) => !channel.enabled);
+  renderConversationList(conversationLists.main, [...enabled, ...disabled]);
 }
 function time(value) { return value ? new Date(value).toLocaleString() : "Never"; }
 function shortTime(value) { return value ? new Date(value).toLocaleString() : "None yet"; }
@@ -169,13 +196,9 @@ function renderDashboardData(status, channels, jobs) {
   renderOverview(status, socket, channels, jobs);
   $("#discover-conversations").disabled = !status.userTokenConfigured;
   $("#discovery-status").textContent = status.userTokenConfigured ? "" : "Choose a User Token in Settings to enable discovery.";
-  const activeChannels = channels.filter((channel) => channel.enabled);
-  const offChannels = channels.filter((channel) => !channel.enabled);
-  $("#channels").innerHTML = activeChannels.length ? activeChannels.map(channelRow).join("") : "<tr><td colspan=\"5\" class=\"form-status\">Find accessible conversations or include one by ID to begin.</td></tr>";
-  $("#off-conversations").hidden = !offChannels.length;
-  $("#off-count").textContent = String(offChannels.length);
-  $("#off-channels").innerHTML = offChannels.map(channelRow).join("");
-  $("#cleanup-off-conversations").disabled = !offChannels.length;
+  latestChannels = channels;
+  renderConversationLists();
+  $("#cleanup-off-conversations").disabled = !channels.some((channel) => !channel.enabled);
   $("#consumer-progress").innerHTML = status.consumers.length ? status.consumers.map((consumer) => {
     const progress = progressPercent(consumer.acknowledgedMessages, consumer.totalMessages);
     const averageDuration = consumer.reportedRuns ? duration(Math.round(consumer.totalDurationMs / consumer.reportedRuns)) : "—";
@@ -215,6 +238,7 @@ async function loadDashboard() {
 async function refreshDashboard() { try { await loadDashboard(); } catch { /* Status is already visible in the top bar. */ } }
 async function post(url, body) { const response = await fetch(url, { method: "POST", headers: body ? { "Content-Type": "application/json" } : undefined, body: body ? JSON.stringify(body) : undefined }); if (!response.ok) throw new Error(await response.text()); return response.status === 204 ? undefined : response.json(); }
 function serverError(error) { try { const parsed = JSON.parse(error.message); if (parsed && typeof parsed.error === "string") return parsed.error; } catch { /* the body was not a JSON error envelope */ } return error instanceof Error ? error.message : "Action failed."; }
+function setStatus(selector, message, isError = false) { const status = $(selector); status.textContent = message; status.classList.toggle("error", isError); }
 function confirmAction(message, confirmLabel = "Continue") { confirmCopy.textContent = message; $("#confirm-action").textContent = confirmLabel; confirmDialog.showModal(); return new Promise((resolve) => confirmDialog.addEventListener("close", () => resolve(confirmDialog.returnValue === "confirm"), { once: true })); }
 
 document.querySelectorAll("[data-onboarding-token]").forEach((button) => button.addEventListener("click", () => configureOnboardingToken(button.dataset.onboardingToken)));
@@ -234,25 +258,66 @@ $("#test-settings").addEventListener("click", async () => { const button = $("#t
 settingsForm.addEventListener("submit", async (event) => { event.preventDefault(); const button = $("#save-settings"); setPending(button, true, "Saving changes"); settingsStatus.textContent = "Applying local settings and restarting affected services…"; try { const result = await post("/dashboard/settings", formValues(settingsForm)); if (result.mcpAuthToken) { $("#mcp-token").textContent = result.mcpAuthToken; $("#mcp-token-result").hidden = false; } settingsForm.querySelectorAll("input[type=password]").forEach((input) => { input.value = ""; }); const filteredNote = result.filteredOffNames?.length ? ` The name filter turned off and purged ${result.filteredOffNames.length} conversation${result.filteredOffNames.length === 1 ? "" : "s"}.` : ""; settingsStatus.textContent = `Settings saved.${filteredNote}`; await refreshDashboard(); } catch (error) { settingsStatus.textContent = serverError(error); console.error(error); } finally { setPending(button, false); } });
 $("#rotate-mcp-token").addEventListener("click", async () => { if (!await confirmAction("This immediately invalidates MCP credentials used by connected agents. You will need to update every agent.", "Rotate token")) return; const button = $("#rotate-mcp-token"); setPending(button, true, "Rotating token"); try { const result = await post("/dashboard/settings/mcp-token"); $("#mcp-token").textContent = result.mcpAuthToken; $("#mcp-token-result").hidden = false; settingsStatus.textContent = "MCP token rotated. Update connected agents now."; } catch (error) { settingsStatus.textContent = "MCP token could not be rotated."; console.error(error); } finally { setPending(button, false); } });
 $("#copy-mcp-url").addEventListener("click", async () => { const button = $("#copy-mcp-url"); setPending(button, true, "Copying"); try { await navigator.clipboard.writeText(`${window.location.origin}/mcp`); $("#endpoint-status").textContent = "MCP endpoint copied."; } catch { $("#endpoint-status").textContent = "Copy unavailable; select the endpoint above."; } finally { setPending(button, false); } });
-$("#sync-names").addEventListener("click", async () => { const button = $("#sync-names"); setPending(button, true, "Refreshing names"); $("#coverage-status").textContent = "Refreshing conversation and DM participant names…"; try { const { queued } = await post("/dashboard/metadata/sync"); $("#coverage-status").textContent = queued ? `Name lookup queued for ${queued} included conversation${queued === 1 ? "" : "s"}.` : "No included conversations need a name lookup."; await refreshDashboard(); } catch (error) { $("#coverage-status").textContent = "Name refresh could not be queued."; console.error(error); } finally { setPending(button, false); } });
+$("#sync-names").addEventListener("click", async () => { const button = $("#sync-names"); setPending(button, true, "Refreshing names"); setStatus("#coverage-status", "Refreshing conversation and DM participant names…"); try { const { queued } = await post("/dashboard/metadata/sync"); setStatus("#coverage-status", queued ? `Name lookup queued for ${queued} included conversation${queued === 1 ? "" : "s"}.` : "No included conversations need a name lookup."); await refreshDashboard(); } catch (error) { setStatus("#coverage-status", "Name refresh could not be queued.", true); console.error(error); } finally { setPending(button, false); } });
 $("#cleanup-off-conversations").addEventListener("click", async () => {
   const button = $("#cleanup-off-conversations");
-  if (!(await confirmAction("Delete the locally stored messages of every turned-off conversation? This cannot be undone.", "Delete stored messages"))) { $("#coverage-status").textContent = "Cleanup cancelled. Nothing was deleted."; return; }
+  if (!(await confirmAction("Delete the locally stored messages of every turned-off conversation? This cannot be undone.", "Delete stored messages"))) { setStatus("#coverage-status", "Cleanup cancelled. Nothing was deleted."); return; }
   setPending(button, true, "Cleaning up");
-  $("#coverage-status").textContent = "Deleting stored messages of turned-off conversations…";
+  setStatus("#coverage-status", "Deleting stored messages of turned-off conversations…");
   try {
     const { conversations, messagesDeleted } = await post("/dashboard/targets/cleanup");
-    $("#coverage-status").textContent = `Deleted ${messagesDeleted} stored message${messagesDeleted === 1 ? "" : "s"} across ${conversations} turned-off conversation${conversations === 1 ? "" : "s"}.`;
+    setStatus("#coverage-status", `Deleted ${messagesDeleted} stored message${messagesDeleted === 1 ? "" : "s"} across ${conversations} turned-off conversation${conversations === 1 ? "" : "s"}.`);
     await refreshDashboard();
-  } catch (error) { $("#coverage-status").textContent = serverError(error); console.error(error); }
+  } catch (error) { setStatus("#coverage-status", serverError(error), true); console.error(error); }
   finally { setPending(button, false); }
 });
 $("#discover-conversations").addEventListener("click", async () => { const button = $("#discover-conversations"); setPending(button, true, "Finding conversations"); $("#discovery-status").textContent = "Reading conversation and DM participant names…"; try { const { conversations, filteredOffNames } = await post("/dashboard/conversations/discover"); const filteredNote = filteredOffNames?.length ? ` ${filteredOffNames.length} matched the name filter and stay turned off.` : ""; $("#discovery-status").textContent = `Found ${conversations} accessible conversation${conversations === 1 ? "" : "s"}.${filteredNote} Choose Include in recovery coverage for the ones you want.`; await refreshDashboard(); } catch (error) { $("#discovery-status").textContent = "Accessible conversations could not be found."; console.error(error); } finally { setPending(button, false); } });
-$("#target-form").addEventListener("submit", async (event) => { event.preventDefault(); const form = event.currentTarget; const button = form.querySelector("button"); setPending(button, true, "Including conversation"); try { await post("/dashboard/targets", { workspaceId: $("#target-workspace").value, channelId: $("#target-channel").value }); form.reset(); $("#coverage-status").textContent = "Conversation included in recovery coverage."; await refreshDashboard(); } catch (error) { $("#coverage-status").textContent = "Conversation could not be included."; console.error(error); } finally { setPending(button, false); } });
+$("#target-form").addEventListener("submit", async (event) => { event.preventDefault(); const form = event.currentTarget; const button = form.querySelector("button"); setPending(button, true, "Including conversation"); try { await post("/dashboard/targets", { workspaceId: $("#target-workspace").value, channelId: $("#target-channel").value }); form.reset(); setStatus("#coverage-status", "Conversation included in recovery coverage."); await refreshDashboard(); } catch (error) { setStatus("#coverage-status", "Conversation could not be included.", true); console.error(error); } finally { setPending(button, false); } });
 $("#initial-backfill").addEventListener("click", async () => { const button = $("#initial-backfill"); setPending(button, true, "Creating index"); $("#backfill-status").textContent = "Creating history and thread index job…"; try { await post("/dashboard/backfill/initial"); await refreshDashboard(); } catch (error) { $("#backfill-status").textContent = "Index job could not be queued."; console.error(error); } finally { setPending(button, false); } });
 $("#manual-backfill-form").addEventListener("submit", async (event) => { event.preventDefault(); const form = event.currentTarget; const button = form.querySelector("button"); setPending(button, true, "Queueing fetch"); $("#backfill-status").textContent = "Queueing selected time range…"; try { await post("/dashboard/backfill/manual", { startAt: new Date($("#backfill-start").value).toISOString(), endAt: new Date($("#backfill-end").value).toISOString() }); await refreshDashboard(); } catch (error) { $("#backfill-status").textContent = "Time range could not be queued."; console.error(error); } finally { setPending(button, false); } });
-document.addEventListener("click", async (event) => { const button = event.target instanceof Element ? event.target.closest("button") : null; if (!(button instanceof HTMLButtonElement)) return; if (button.dataset.copyChannelId) { try { await navigator.clipboard.writeText(button.dataset.copyChannelId); $("#coverage-status").textContent = "Conversation ID copied."; } catch (error) { $("#coverage-status").textContent = "Could not copy the conversation ID."; console.error(error); } return; } let action; let status = $("#backfill-status"); if (button.dataset.cancelJob) action = async () => { if (await confirmAction("Cancel this recovery job? Completed work stays stored locally.", "Cancel job")) await post(`/dashboard/backfill/${button.dataset.cancelJob}/cancel`); }; if (button.dataset.setCoverage) { status = $("#coverage-status"); const enabling = button.dataset.setCoverage === "true"; action = async () => { if (!enabling && !(await confirmAction("Turning off history recovery immediately deletes this conversation's locally stored messages. Re-enabling later will not restore them.", "Turn off & delete"))) return "canceled"; await post("/dashboard/targets/coverage", { workspaceId: button.dataset.workspaceId, channelId: button.dataset.channelId, enabled: enabling }); return "applied"; }; } if (!action) return; setPending(button, true, button.dataset.cancelJob ? "Cancelling" : "Updating recovery"); try { const outcome = await action(); if (button.dataset.setCoverage) { if (outcome === "canceled") { status.textContent = "Turn-off cancelled. Nothing was changed."; return; } status.textContent = button.dataset.setCoverage === "true" ? "History recovery enabled for this conversation." : "History recovery turned off and stored messages deleted."; } await refreshDashboard(); } catch (error) { status.textContent = serverError(error); console.error(error); } finally { setPending(button, false); } });
+document.addEventListener("click", async (event) => {
+  const button = event.target instanceof Element ? event.target.closest("button") : null;
+  if (!(button instanceof HTMLButtonElement)) return;
+  if (button.dataset.copyChannelId) {
+    try { await navigator.clipboard.writeText(button.dataset.copyChannelId); setStatus("#coverage-status", "Conversation ID copied."); }
+    catch (error) { setStatus("#coverage-status", "Could not copy the conversation ID.", true); console.error(error); }
+    return;
+  }
+  let action;
+  let statusSelector = "#backfill-status";
+  if (button.dataset.cancelJob) action = async () => { if (await confirmAction("Cancel this recovery job? Completed work stays stored locally.", "Cancel job")) await post(`/dashboard/backfill/${button.dataset.cancelJob}/cancel`); };
+  if (button.dataset.setCoverage) {
+    statusSelector = "#coverage-status";
+    const enabling = button.dataset.setCoverage === "true";
+    action = async () => {
+      if (!enabling && !(await confirmAction("Turning off history recovery immediately deletes this conversation's locally stored messages. Re-enabling later will not restore them.", "Turn off & delete"))) return "canceled";
+      await post("/dashboard/targets/coverage", { workspaceId: button.dataset.workspaceId, channelId: button.dataset.channelId, enabled: enabling });
+      return "applied";
+    };
+  }
+  if (!action) return;
+  setPending(button, true, button.dataset.cancelJob ? "Cancelling" : "Updating recovery");
+  try {
+    const outcome = await action();
+    if (button.dataset.setCoverage) {
+      if (outcome === "canceled") { setStatus("#coverage-status", "Turn-off cancelled. Nothing was changed."); return; }
+      setStatus("#coverage-status", button.dataset.setCoverage === "true" ? "History recovery enabled for this conversation." : "History recovery turned off and stored messages deleted.");
+    }
+    await refreshDashboard();
+  } catch (error) { setStatus(statusSelector, serverError(error), true); console.error(error); }
+  finally { setPending(button, false); }
+});
 document.addEventListener("keydown", (event) => { if (event.key === "Escape" && !settingsLayer.hidden) closeSettings(); });
+for (const list of Object.values(conversationLists)) {
+  list.search.addEventListener("input", () => { list.query = list.search.value; list.page = 1; renderConversationLists(); });
+  list.pager.addEventListener("click", (event) => {
+    const button = event.target instanceof Element ? event.target.closest("[data-pager]") : null;
+    if (!(button instanceof HTMLButtonElement)) return;
+    const pageCount = Math.max(1, Math.ceil(list.filteredCount / conversationPageSize));
+    list.page = button.dataset.pager.endsWith(":next") ? Math.min(pageCount, list.page + 1) : Math.max(1, list.page - 1);
+    renderConversationLists();
+  });
+}
 window.addEventListener("hashchange", () => setView(window.location.hash.slice(1), false));
 $("#backfill-start").value = datetimeInput(new Date(Date.now() - 24 * 60 * 60 * 1000));
 $("#backfill-end").value = datetimeInput(new Date());
