@@ -8,6 +8,7 @@ import { dashboardSettings, newMcpAuthToken, settingsFromInput } from "./setting
 
 const database = new Database(bootstrapConfig.databaseUrl);
 await database.migrate();
+await database.recordProcessStart();
 const runtime = new ObserverRuntime(database);
 await runtime.apply(await database.observerSettings());
 
@@ -19,7 +20,7 @@ app.get("/mcp", handleMcp);
 app.get("/dashboard/status", async (_request, response, next) => {
   try {
     const settings = await database.observerSettings();
-    response.json({ ...(await database.dashboardStatus()), socketMode: runtime.socketStatus(), userTokenConfigured: runtime.userTokenConfigured(), settings: dashboardSettings(settings) });
+    response.json({ ...(await database.dashboardStatus()), database: await database.databaseHealth(), socketMode: runtime.socketStatus(), userTokenConfigured: runtime.userTokenConfigured(), settings: dashboardSettings(settings) });
   } catch (error) { next(error); }
 });
 app.get("/dashboard/settings", async (_request, response, next) => {

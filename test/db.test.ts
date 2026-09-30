@@ -86,3 +86,49 @@ test("stores normalized changed text for an enabled observation target", async (
   const insert = queries.find((query) => query.text.includes("INSERT INTO messages"));
   assert.equal(insert?.values?.[8], "After edit");
 });
+
+test("reports database connectivity and keeps the last connection error visible", async () => {
+  const database = Object.create(Database.prototype) as Database;
+  let failing = false;
+  const incidentInserts: string[] = [];
+  (database as unknown as { pool: { query: (text: string) => Promise<unknown> } }).pool = {
+    query: async (text: string) => {
+      if (text === "SELECT 1") { if (failing) throw new Error("server closed the connection unexpectedly"); return { rows: [] }; }
+      if (text.includes("INSERT INTO connection_incidents")) { incidentInserts.push(text); return { rowCount: 1 }; }
+      throw new Error(`Unexpected query: ${text}`);
+    },
+  };
+
+  assert.deepEqual(await database.databaseHealth(), { connected: true, lastError: null });
+  failing = true;
+  const unhealthy = await database.databaseHealth();
+  assert.equal(unhealthy.connected, false);
+  assert.equal(unhealthy.lastError?.message, "server closed the connection unexpectedly");
+  assert.equal(incidentInserts.length, 1);
+});
+
+test("collapses repeated identical incidents inside a one-minute window", async () => {
+  const database = Object.create(Database.prototype) as Database;
+  let inserts = 0;
+  (database as unknown as { pool: { query: (text: string) => Promise<unknown> } }).pool = {
+    query: async (text: string) => {
+      if (text.includes("INSERT INTO connection_incidents")) { inserts += 1; return { rowCount: 1 }; }
+      throw new Error(`Unexpected query: ${text}`);
+    },
+  };
+
+  await database.recordIncident("postgres-pool", "terminating connection due to administrator command");
+  await database.recordIncident("postgres-pool", "terminating connection due to administrator command");
+  await database.recordIncident("postgres-pool", "terminating connection due to administrator command");
+  await database.recordIncident("process", "Observer process started");
+  assert.equal(inserts, 2);
+});
+
+test("keeps the process alive when an idle Postgres client fails", async () => {
+  const database = new Database("postgres://observer:invalid@127.0.0.1:1/observer");
+  assert.doesNotThrow(() => database.pool.emit("error", new Error("terminating connection due to administrator command")));
+  const health = await database.databaseHealth();
+  assert.equal(health.connected, false);
+  assert.ok(health.lastError);
+  await database.close();
+});

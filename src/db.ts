@@ -12,13 +12,49 @@ export type BackfillJob = { id: number; kind: "initial" | "manual" | "downtime";
 export type ConsumerUsage = { inputTokens: number; outputTokens: number; durationMs: number };
 export type ConsumerProgress = { consumerId: string; totalMessages: number; acknowledgedMessages: number; pendingMessages: number; lastAcknowledgedAt: string | null; reportedRuns: number; inputTokens: number; outputTokens: number; totalTokens: number; totalDurationMs: number; lastConsumedAt: string | null };
 export type ConsumerConsumptionRecord = { consumerId: string; acknowledgedMessages: number; inputTokens: number; outputTokens: number; totalTokens: number; durationMs: number; acknowledgedAt: string };
+export type DatabaseHealth = { connected: boolean; lastError: { message: string; at: string } | null };
+export type ConnectionIncident = { source: string; message: string; occurredAt: string };
 
 export class Database {
   readonly pool: Pool;
+  private lastDatabaseError: { message: string; at: string } | null = null;
+  private lastIncident: { source: string; message: string; at: number } | null = null;
 
   constructor(connectionString: string) {
     // Cap connections so several services can share one Postgres instance.
     this.pool = new Pool({ connectionString, max: 5 });
+    // Without a listener an idle-client failure crashes the whole process (2026-09-28); record it instead so the dashboard can show the outage.
+    this.pool.on("error", (error: Error) => {
+      const message = error.message || "Postgres connection failure";
+      this.lastDatabaseError = { message, at: new Date().toISOString() };
+      void this.recordIncident("postgres-pool", message);
+    });
+  }
+
+  async databaseHealth(): Promise<DatabaseHealth> {
+    try {
+      await this.pool.query("SELECT 1");
+      return { connected: true, lastError: this.lastDatabaseError ?? null };
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "Postgres is unreachable";
+      this.lastDatabaseError = { message, at: new Date().toISOString() };
+      await this.recordIncident("postgres-pool", message);
+      return { connected: false, lastError: this.lastDatabaseError };
+    }
+  }
+
+  async recordProcessStart(): Promise<void> {
+    await this.recordIncident("process", "Observer process started");
+    await this.pool.query("DELETE FROM connection_incidents WHERE id <= (SELECT max(id) - 200 FROM connection_incidents)");
+  }
+
+  /** Persists reliability events; identical repeats within a minute only move the timestamp. */
+  async recordIncident(source: string, message: string): Promise<void> {
+    const at = Date.now();
+    if (this.lastIncident && this.lastIncident.source === source && this.lastIncident.message === message && at - this.lastIncident.at < 60_000) { this.lastIncident.at = at; return; }
+    this.lastIncident = { source, message, at };
+    console.error(`[incident] ${source}: ${message}`);
+    try { await this.pool.query(`INSERT INTO connection_incidents (source, message) VALUES ($1, $2)`, [source, message]); } catch { /* The database being down is itself the incident. */ }
   }
 
   async migrate(): Promise<void> {
@@ -69,6 +105,9 @@ export class Database {
         PRIMARY KEY (workspace_id, channel_id)
       );
       ALTER TABLE channel_metadata ADD COLUMN IF NOT EXISTS conversation_type TEXT NOT NULL DEFAULT 'unknown';
+      CREATE TABLE IF NOT EXISTS connection_incidents (
+        id BIGSERIAL PRIMARY KEY, source TEXT NOT NULL, message TEXT NOT NULL, occurred_at TIMESTAMPTZ NOT NULL DEFAULT now()
+      );
       CREATE TABLE IF NOT EXISTS observation_targets (
         workspace_id TEXT NOT NULL, channel_id TEXT NOT NULL, enabled BOOLEAN NOT NULL DEFAULT true,
         created_at TIMESTAMPTZ NOT NULL DEFAULT now(), updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
@@ -530,7 +569,7 @@ export class Database {
       FROM backfill_jobs j LEFT JOIN backfill_tasks t ON t.job_id = j.id GROUP BY j.id ORDER BY j.id DESC LIMIT 20`);
     return result.rows.map(toJob);
   }
-  async dashboardStatus(): Promise<{ events: number; messages: number; lastReceivedAt: string | null; channels: number; earliestMessageAt: string | null; nextBackfillRequestAt: string | null; consumers: ConsumerProgress[]; consumptionRecords: ConsumerConsumptionRecord[] }> {
+  async dashboardStatus(): Promise<{ events: number; messages: number; lastReceivedAt: string | null; channels: number; earliestMessageAt: string | null; nextBackfillRequestAt: string | null; consumers: ConsumerProgress[]; consumptionRecords: ConsumerConsumptionRecord[]; incidents: ConnectionIncident[] }> {
     const result = await this.pool.query<{ events: string; messages: string; last_received_at: string | null; channels: string; earliest_message_at: string | null; next_request_at: string | null }>(
       `SELECT (SELECT count(*) FROM slack_events)::text AS events, (SELECT count(*) FROM messages)::text AS messages,
        (SELECT max(received_at)::text FROM slack_events) AS last_received_at, (SELECT count(*) FROM observation_targets WHERE enabled)::text AS channels,
@@ -548,7 +587,9 @@ export class Database {
        GROUP BY c.consumer_id, u.reported_runs, u.input_tokens, u.output_tokens, u.total_duration_ms, u.last_consumed_at ORDER BY max(a.acknowledged_at) DESC NULLS LAST, u.last_consumed_at DESC NULLS LAST, c.consumer_id`);
     const consumptionRecords = await this.pool.query<{ consumer_id: string; acknowledged_messages: string; input_tokens: string; output_tokens: string; duration_ms: string; acknowledged_at: string }>(
       `SELECT consumer_id, acknowledged_messages::text, input_tokens::text, output_tokens::text, duration_ms::text, acknowledged_at::text FROM consumer_consumption_records ORDER BY acknowledged_at DESC LIMIT 50`);
-    const row = result.rows[0]; return { events: Number(row.events), messages: Number(row.messages), lastReceivedAt: row.last_received_at, channels: Number(row.channels), earliestMessageAt: row.earliest_message_at, nextBackfillRequestAt: row.next_request_at, consumers: consumers.rows.map(toConsumerProgress), consumptionRecords: consumptionRecords.rows.map(toConsumerConsumptionRecord) };
+    const incidents = await this.pool.query<{ source: string; message: string; occurred_at: string }>(
+      `SELECT source, message, occurred_at::text FROM connection_incidents ORDER BY id DESC LIMIT 5`);
+    const row = result.rows[0]; return { events: Number(row.events), messages: Number(row.messages), lastReceivedAt: row.last_received_at, channels: Number(row.channels), earliestMessageAt: row.earliest_message_at, nextBackfillRequestAt: row.next_request_at, consumers: consumers.rows.map(toConsumerProgress), consumptionRecords: consumptionRecords.rows.map(toConsumerConsumptionRecord), incidents: incidents.rows.map((incident) => ({ source: incident.source, message: incident.message, occurredAt: incident.occurred_at })) };
   }
   async observerSettings(): Promise<ObserverSettings> {
     const result = await this.pool.query<SettingsRow>(`SELECT slack_app_token, slack_user_token, slack_bot_token, mcp_auth_token, thread_settle_seconds, message_retention_days, raw_event_retention_days, backfill_request_interval_seconds, downtime_suggestion_seconds, conversation_name_filter_terms FROM observer_settings WHERE singleton`);

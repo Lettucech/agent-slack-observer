@@ -120,6 +120,12 @@ function setSettingsTokenType(type) {
 function openSettings(opener = settingsToggle) { lastSettingsOpener = opener; settingsLayer.hidden = false; document.body.classList.add("drawer-open"); settingsToggle.setAttribute("aria-expanded", "true"); window.setTimeout(() => settingsDrawer.focus(), 0); }
 function closeSettings() { settingsLayer.hidden = true; document.body.classList.remove("drawer-open"); settingsToggle.setAttribute("aria-expanded", "false"); lastSettingsOpener?.focus(); }
 function socketLabel(socket) { return socket.state === "connected" ? "Connected" : socket.state === "not_configured" ? "Setup required" : socket.state === "reconnecting" ? "Reconnecting" : socket.state === "stopped" ? "Stopped" : "Connecting"; }
+function databaseCard(database) {
+  const connected = Boolean(database?.connected);
+  const detail = database?.lastError ? `Last error ${shortTime(database.lastError.at)} · ${database.lastError.message}` : "No connection errors recorded";
+  return ["Database", connected ? "Connected" : "Unreachable", detail, connected ? "good" : "bad"];
+}
+function incidentSourceLabel(source) { return source === "process" ? "Process restart" : "Postgres"; }
 function socketTone(socket) { return socket.state === "connected" ? "good" : socket.state === "not_configured" || socket.state === "stopped" ? "neutral" : socket.lastError ? "bad" : "warning"; }
 function setView(view, updateHash = true) { if (!pageTitles.has(view)) return; navButtons.forEach((button) => button.classList.toggle("is-active", button.dataset.view === view)); viewPanels.forEach((panel) => { const active = panel.dataset.viewPanel === view; panel.hidden = !active; panel.classList.toggle("is-active", active); }); if (updateHash && window.location.hash !== `#${view}`) history.replaceState(null, "", `#${view}`); }
 function compactRow(label, value) { return `<div class="compact-row"><strong>${escapeHtml(label)}</strong><span>${value}</span></div>`; }
@@ -144,10 +150,13 @@ function renderOverview(status, socket, channels, jobs) {
   const pendingMessages = status.consumers.reduce((sum, consumer) => sum + consumer.pendingMessages, 0);
   $("#overview-health").innerHTML = [
     ["Socket Mode", socketLabel(socket), socket.lastError ?? (socket.lastEventAt ? `Last event ${shortTime(socket.lastEventAt)}` : "Awaiting the first event"), tone],
+    databaseCard(status.database),
     ["Local data", `${status.messages} messages`, `${status.events} raw events · since ${shortTime(status.earliestMessageAt)}`, ""],
     ["Backfill queue", activeJobs.length ? `${activeJobs.length} active` : "Idle", status.nextBackfillRequestAt ? `Next request ${shortTime(status.nextBackfillRequestAt)}` : "No scheduled Slack request", ""],
     ["Agent delivery", `${status.consumers.length} agent${status.consumers.length === 1 ? "" : "s"}`, `${pendingMessages} pending acknowledgement${pendingMessages === 1 ? "" : "s"}`, ""],
   ].map(([label, value, detail, toneClass]) => `<article class="health-card"><span>${label}</span><strong class="socket-value ${toneClass}">${escapeHtml(value)}</strong><small>${escapeHtml(detail)}</small></article>`).join("");
+  const incidents = status.incidents ?? [];
+  $("#overview-incidents").innerHTML = incidents.length ? incidents.map((incident) => compactRow(incidentSourceLabel(incident.source), `${shortTime(incident.occurredAt)} · ${incident.message}`)).join("") : "<p>No connection incidents recorded.</p>";
   const coveredChannels = channels.filter((channel) => channel.enabled);
   $("#overview-channels").innerHTML = coveredChannels.length ? coveredChannels.slice(0, 3).map((channel) => compactRow(conversationTitle(channel), `${conversationTypeLabel(channel.conversationType)} · ${channel.messageCount} messages · ${shortTime(channel.lastObservedAt)}`)).join("") : "<p>No conversations are in coverage yet.</p>";
   $("#overview-backfill").innerHTML = jobs.length ? jobs.slice(0, 3).map((job) => compactRow(`#${job.id} ${jobLabel(job.kind)}`, `${job.completedTasks}/${job.totalTasks} tasks · ${job.state}`)).join("") : "<p>No recovery jobs yet.</p>";
