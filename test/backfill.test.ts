@@ -47,3 +47,23 @@ test("honors Slack Retry-After globally and leaves the task resumable", async ()
     assert.ok(retries[0].at.getTime() >= Date.now() + 119_000);
   } finally { globalThis.fetch = originalFetch; }
 });
+
+test("sends the task's ISO window as Slack epoch timestamps, not raw ISO strings", async () => {
+  const originalFetch = globalThis.fetch;
+  let query = "";
+  const database: BackfillDatabase = {
+    backfillRuntime: async () => ({ nextRequestAt: null }),
+    claimBackfillTask: async () => ({ ...historyTask, cursor: null, oldest: "2026-10-08T12:33:14.187Z", latest: "2026-10-15T07:29:29.800Z" }),
+    threadNeedsRefresh: async () => assert.fail("history should not check thread state"), storeHistoryPage: async () => undefined,
+    storeReplies: async () => assert.fail("history should not store replies"), completeHistoryTask: async () => undefined,
+    completeBackfillTask: async () => assert.fail("history should not complete a reply task"), retryBackfillTask: async () => assert.fail("history request should succeed"),
+    setBackfillRuntime: async () => undefined, purgeExpired: async () => undefined,
+  };
+  globalThis.fetch = async (url) => { query = String(url); return new Response(JSON.stringify({ ok: true, messages: [], response_metadata: {} })); };
+  try {
+    const worker = new SlackBackfillWorker("xoxb-test", database, { requestIntervalSeconds: 60, rawEventRetentionDays: 7, messageRetentionDays: 30 });
+    assert.deepEqual(await worker.runOnce(), { state: "worked" });
+    assert.match(query, /oldest=1791462794\.187000/);
+    assert.match(query, /latest=1792049369\.800000/);
+  } finally { globalThis.fetch = originalFetch; }
+});

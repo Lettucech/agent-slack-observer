@@ -101,7 +101,8 @@ export class SlackBackfillWorker {
   }
 
   private async fetchPage(task: BackfillTask): Promise<{ messages: SlackHistoryMessage[]; cursor: string | null }> {
-    const parameters = new URLSearchParams({ channel: task.channelId, oldest: task.oldest, latest: task.latest, limit: "100" });
+    // Slack ts parameters are epoch-second floats; the queue stores ISO windows, and a float-parsed ISO string lands in 1970.
+    const parameters = new URLSearchParams({ channel: task.channelId, oldest: slackTimestamp(task.oldest), latest: slackTimestamp(task.latest), limit: "100" });
     if (task.phase === "history" && task.cursor) parameters.set("cursor", task.cursor);
     if (task.phase === "replies") {
       if (!task.rootTs) throw new Error("Reply task is missing its root timestamp");
@@ -126,6 +127,10 @@ export class SlackBackfillWorker {
 
 class RateLimitError extends Error {
   constructor(readonly retryAfterMs: number) { super(`Slack backfill rate limited; retry after ${Math.ceil(retryAfterMs / 1000)}s`); }
+}
+function slackTimestamp(value: string): string {
+  if (/^-?\d+(\.\d+)?$/.test(value)) return value;
+  return (Date.parse(value) / 1000).toFixed(6);
 }
 function isSlackMessage(value: unknown): value is SlackHistoryMessage { return isObject(value) && typeof value.ts === "string"; }
 function isOk(value: unknown): value is Record<string, unknown> & { ok: true } { return isObject(value) && value.ok === true; }
